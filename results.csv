@@ -1,0 +1,11 @@
+file,lines,manufacturer,address,net_quantity,mrp,mfg_date,consumer_care,detected,flags
+chilli.jpg,24,Packed by:COLDSTAR LOGISTICS,Haryana-131103,,MRP : Rs. 31.00,,Email: cs-aripl@amazon.in,6-Apr,overprint_drift_-1.5rows
+creatin.jpg,47,MARKETED BY: Bright Lifecare,"Gurugram, Haryana-122007, In",,1USP Rs 4.06.9),,customer care executive at P,6-Apr,overprint_drift_-10.6rows;skip_date-order
+iron.jpg,25,Manufactured By and Contact ,"Tehsil-Nalagarh, Dist.-Solan",,Maximum Retail Price : # 825,,Tel: 1800 572 1800. (Toll Fr,6-Apr,overprint_drift_-6.7rows
+oats.jpg,35,,ATAKA-572138,,,,,6-Jan,overprint_drift_+0.8rows;skip_date-order
+oil.jpg,35,Marketed By: AWL Agri Busine,Railway Crossing. Ahmedabad ,,rU3P± 0.28,, care@awl.in,6-Apr,capture_merged_columns;overprint_drift_-2.4rows;skip_date-order
+pen.jpg,30,Manufactured and Marketed by,J-19.G.I.D.C.UMBERGAON-39617,,MRP:80.00 (incl. of all taxe,MFD:08/2025,Tel:1-800-2741250(tollfree),6-May,overprint_drift_-1.0rows;skip_date-order
+perfume.jpg,33,Marketed by.,"Ahmedabad - 382220, Gujarat.",,MRP (Incl. of all taxes),Manufactured by: 12/2025,contact our Customer Care Ex,6-May,overprint_drift_+20.6rows;skip_date-order
+seed.jpg,43,PACKED&MARKETEDBY:,"Indore,Madhya Pradesh, India",,"Pkg. Htrl. Mfd, By: Pacific ",,Customer Care Executive onth,6-Apr,overprint_drift_+12.4rows;skip_date-order
+sun.jpg,46,MARKETED BY: Re'equil India ,"Chandigarh, 160002, INDIA",NET QUANTITY: 50 g,M.R.P. R. : (Incl. of all ta,,www.reequil.com,6-May,overprint_drift_+10.6rows;skip_date-order
+wal.jpg,57,Marketed by : VMG FOODS PVT.,Khari Baoli Delhi-110006 Del,Net Weight : 250 g,1.6,,email us at: info@vinoddryfr,6-May,skip_date-order
