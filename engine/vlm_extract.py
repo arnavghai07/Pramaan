@@ -123,9 +123,30 @@ def encode_image(path, max_side=1600):
         return base64.b64encode(fh.read()).decode()
 
 
-def ollama_models(host="http://localhost:11434"):
+class BackendError(Exception):
+    """A vision backend (Ollama/Gemini) could not be reached or refused the request.
+
+    Raised instead of calling sys.exit() so this module stays importable: a
+    server process embedding these functions (the FastAPI app) must be able to
+    catch a bad request from one caller without the whole process dying.
+    """
+
+
+class ExtractionFailed(Exception):
+    """No image orientation produced a usable extraction.
+
+    Carries .tried, the same per-orientation diagnostic list the CLI prints,
+    so a caller (CLI or API) can report exactly what was attempted.
+    """
+    def __init__(self, tried):
+        self.tried = tried
+        super().__init__("no orientation produced usable JSON")
+
+
+def ollama_models(host=None):
     """What is actually installed? Ollama answers 400 for an unknown model."""
     import urllib.request
+    host = host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
     try:
         with urllib.request.urlopen(host + "/api/tags", timeout=10) as r:
             return [m["name"] for m in json.loads(r.read()).get("models", [])]
@@ -133,7 +154,7 @@ def ollama_models(host="http://localhost:11434"):
         return None
 
 
-def call_ollama(image_path, model="qwen2.5vl:7b", host="http://localhost:11434",
+def call_ollama(image_path, model=None, host=None,
                 force_json=True, debug=False):
     """
     Ask Ollama for one extraction.
@@ -153,6 +174,9 @@ def call_ollama(image_path, model="qwen2.5vl:7b", host="http://localhost:11434",
        still recover. A messy answer beats no answer.
     """
     import urllib.request, urllib.error
+
+    model = model or os.environ.get("VLM_MODEL", "qwen2.5vl:7b")
+    host = host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
     b64 = encode_image(image_path)
     payload = {"model": model, "prompt": PROMPT, "images": [b64],
@@ -182,26 +206,25 @@ def call_ollama(image_path, model="qwen2.5vl:7b", host="http://localhost:11434",
             detail = json.loads(detail).get("error", detail)
         except Exception:
             pass
-        print(f"\nOllama refused the request (HTTP {e.code}):")
-        print(f"  {detail}\n")
+        msg = f"\nOllama refused the request (HTTP {e.code}):\n  {detail}\n"
         have = ollama_models(host)
         if have is not None:
-            print("Installed models:" if have else "No models installed.")
+            msg += "\nInstalled models:" if have else "\nNo models installed."
             for m in have:
-                print("   ", m)
-            print("\n   ollama pull qwen2.5vl:7b    (bigger, much better on busy labels)")
-        sys.exit(1)
+                msg += f"\n    {m}"
+            msg += "\n\n   ollama pull qwen2.5vl:7b    (bigger, much better on busy labels)"
+        raise BackendError(msg) from e
 
     except urllib.error.URLError as e:
-        sys.exit(f"\nCannot reach Ollama at {host}: {e.reason}\n"
-                 "Open the Ollama app from the Start menu, then retry.")
+        raise BackendError(f"\nCannot reach Ollama at {host}: {e.reason}\n"
+                           "Open the Ollama app from the Start menu, then retry.") from e
 
 
 def call_gemini(image_path, model="gemini-2.0-flash"):
     import urllib.request
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        sys.exit("set GEMINI_API_KEY, or use --backend ollama")
+        raise BackendError("set GEMINI_API_KEY, or use --backend ollama")
     b64 = encode_image(image_path)
     mime = "image/jpeg"
     body = json.dumps({"contents": [{"parts": [
@@ -267,6 +290,53 @@ def score_result(d):
     """How much did this orientation actually recover? Non-null mandatory fields."""
     return sum(1 for k in MANDATORY
                if d.get(k) not in (None, "", "null", "ILLEGIBLE"))
+
+
+def extract_fields(image_path, backend="ollama", model=None, debug=False,
+                   all_rotations=False):
+    """
+    Try each orientation against the vision backend, keep the richest result.
+
+    This is the rotation-trying loop that used to live inline in main(). It is
+    pulled out so it can be called from an importable function (extract, below)
+    as well as the CLI, with no dependency on argparse.
+
+    Returns (fields, best_rotation_label, tried) on success.
+    Raises BackendError if the backend itself could not be reached (this
+    propagates immediately, same as the old sys.exit did — no point trying
+    the other three rotations if Ollama is down). Raises ExtractionFailed if
+    every orientation was reachable but none produced usable JSON.
+    """
+    def call_backend(path):
+        if backend != "ollama":
+            return call_gemini(path, model or "gemini-2.0-flash")
+        raw = call_ollama(path, model, force_json=True, debug=debug)
+        if not str(raw).strip():
+            if debug:
+                print("    [debug] empty with format=json, retrying unconstrained")
+            raw = call_ollama(path, model, force_json=False, debug=debug)
+        return raw
+
+    best, best_score, best_rot, tried = None, -1, None, []
+    for label, path in rotations(image_path):
+        try:
+            d = parse_json(call_backend(path))
+        except ValueError as e:
+            tried.append(f"{label}: {e}")
+            continue
+        sc = score_result(d)
+        tried.append(f"{label}: {sc}/{len(MANDATORY)} mandatory fields")
+        if sc > best_score:
+            best, best_score, best_rot = d, sc, label
+        if sc == len(MANDATORY):
+            break                       # nothing left to gain
+        if not all_rotations:
+            if sc >= 4:
+                break                   # good enough, stop burning compute
+
+    if best is None:
+        raise ExtractionFailed(tried)
+    return best, best_rot, tried
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +428,49 @@ def validate(d):
     return rows, problems
 
 
+def extract(image_path, backend="ollama", model=None, debug=False,
+           all_rotations=False):
+    """
+    Run extraction + validation end to end and return a plain dict.
+
+    This is the importable core Phase A calls for: everything main() used to
+    do between "ask the model" and "print the table", with no printing and no
+    sys.exit, so both the CLI and POST /scan can call it and are guaranteed to
+    report the same thing for the same image. validate() itself is untouched;
+    its (field, state, value, mandatory) tuples are converted to dicts here,
+    at this API boundary, only.
+
+    Returns:
+        {
+          "fields":              raw schema dict as returned by the model,
+          "rows":                [{"field", "state", "value", "mandatory"}, ...],
+          "problems":            [str, ...] cross-check failures,
+          "mandatory_present":   int,
+          "mandatory_total":     int,
+          "best_rotation":       "0 deg" / "90 deg" / ...,
+          "orientations_tried":  [str, ...] one diagnostic line per rotation,
+        }
+
+    Raises BackendError or ExtractionFailed — see extract_fields().
+    """
+    fields, best_rot, tried = extract_fields(image_path, backend=backend, model=model,
+                                             debug=debug, all_rotations=all_rotations)
+    rows, problems = validate(fields)
+    row_dicts = [{"field": k, "state": state, "value": v, "mandatory": mand}
+                for k, state, v, mand in rows]
+    mandatory_present = sum(1 for r in row_dicts
+                            if r["mandatory"] and r["state"] == "PRESENT")
+    return {
+        "fields": fields,
+        "rows": row_dicts,
+        "problems": problems,
+        "mandatory_present": mandatory_present,
+        "mandatory_total": len(MANDATORY),
+        "best_rotation": best_rot,
+        "orientations_tried": tried,
+    }
+
+
 # ---------------------------------------------------------------------------
 SELFTEST = [
     ("walnut, MRP/USP swapped", {
@@ -428,39 +541,17 @@ def main():
     if a.selftest or not a.image:
         sys.exit(0 if selftest() else 1)
 
-    def run(path):
-        if a.backend != "ollama":
-            return call_gemini(path, a.model or "gemini-2.0-flash")
-        m = a.model or "qwen2.5vl:7b"
-        raw = call_ollama(path, m, force_json=True, debug=a.debug)
-        if not str(raw).strip():
-            if a.debug:
-                print("    [debug] empty with format=json, retrying unconstrained")
-            raw = call_ollama(path, m, force_json=False, debug=a.debug)
-        return raw
-
-    best, best_score, best_rot, tried = None, -1, None, []
-    for label, path in rotations(a.image):
-        try:
-            d = parse_json(run(path))
-        except ValueError as e:
-            tried.append(f"{label}: {e}")
-            continue
-        sc = score_result(d)
-        tried.append(f"{label}: {sc}/{len(MANDATORY)} mandatory fields")
-        if sc > best_score:
-            best, best_score, best_rot = d, sc, label
-        if sc == len(MANDATORY):
-            break                       # nothing left to gain
-        if not a.all_rotations:
-            if sc >= 4:
-                break                   # good enough, stop burning compute
-
-    print("orientations tried:")
-    for t in tried:
-        print("   " + t)
-    print()
-    if best is None:
+    try:
+        result = extract(a.image, backend=a.backend, model=a.model,
+                         debug=a.debug, all_rotations=a.all_rotations)
+    except BackendError as e:
+        print(str(e))
+        sys.exit(1)
+    except ExtractionFailed as e:
+        print("orientations tried:")
+        for t in e.tried:
+            print("   " + t)
+        print()
         print("No orientation produced usable JSON.\n")
         print("This image is too busy for a 3B model. In order of effort:")
         print("  1. Crop to JUST the declaration block and rerun.")
@@ -473,32 +564,35 @@ def main():
         print("       python vlm_extract.py img.jpg --backend gemini")
         print("\nRun with --debug to see exactly what the model returned.")
         sys.exit(1)
-    if best_rot != "0 deg":
-        print(f"NOTE: best result came from rotating the image {best_rot}. "
+
+    print("orientations tried:")
+    for t in result["orientations_tried"]:
+        print("   " + t)
+    print()
+    if result["best_rotation"] != "0 deg":
+        print(f"NOTE: best result came from rotating the image {result['best_rotation']}. "
               "The label is printed sideways.\n")
-    d = best
-    rows, problems = validate(d)
 
     print(f"{'':<2}{'declaration':<22} {'state':<9} value")
     print("-" * 70)
-    for k, state, v, mand in rows:
-        mark = "* " if mand else "  "
-        print(f"{mark}{k:<22} {state:<9} {str(v)[:34]}")
+    for r in result["rows"]:
+        mark = "* " if r["mandatory"] else "  "
+        print(f"{mark}{r['field']:<22} {r['state']:<9} {str(r['value'])[:34]}")
     print("  (* = mandatory under Rule 6)")
 
     print()
-    if problems:
+    if result["problems"]:
         print("VALIDATION PROBLEMS - do not trust these fields without review")
         print("-" * 70)
-        for p in problems:
+        for p in result["problems"]:
             print("  " + p)
     else:
         print("Validation clean: all cross-checks passed.")
 
-    n = sum(1 for _, st, _, mand in rows if mand and st == "PRESENT")
     print()
-    print(f"VERDICT: {n} of {len(MANDATORY)} mandatory declarations present"
-          + (f", {len(problems)} problem(s) flagged" if problems else ""))
+    print(f"VERDICT: {result['mandatory_present']} of {result['mandatory_total']} "
+          "mandatory declarations present"
+          + (f", {len(result['problems'])} problem(s) flagged" if result["problems"] else ""))
 
 
 if __name__ == "__main__":

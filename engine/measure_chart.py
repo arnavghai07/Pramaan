@@ -30,9 +30,9 @@ def find_marker(bgr):
     return corners[0].reshape(4, 2)
 
 
-def rectify(bgr, pts, out_ppm=20.0):
+def rectify(bgr, pts, marker_mm=MARKER_MM, out_ppm=20.0):
     """Flatten the chart plane so 1 mm == out_ppm px everywhere."""
-    side = MARKER_MM * out_ppm
+    side = marker_mm * out_ppm
     dst = np.float32([[0, 0], [side, 0], [side, side], [0, side]])
     Hm, _ = cv2.findHomography(pts.astype(np.float32), dst)
     h, w = bgr.shape[:2]
@@ -95,35 +95,86 @@ def text_rows(rect, ppm):
     return merged, th
 
 
+class MarkerNotFound(Exception):
+    """No ArUco marker was detected in the image, or the image couldn't be read."""
+
+
+def measure(image_path, marker_mm=MARKER_MM, out_ppm=20.0):
+    """
+    Core measurement pipeline: find the marker, derive px-per-mm, rectify, and
+    measure every text row's height in millimetres.
+
+    Pulled out of main() so the CLI (which additionally compares against the
+    test chart's known TEST_MM ground truth) and POST /measure (which has no
+    ground truth — it is measuring a real, unknown pack) can share it.
+
+    marker_mm is the printed marker's real-world size in millimetres — the
+    "marker size in" input POST /measure takes. It must flow into rectify(),
+    not just into the raw capture-scale estimate: rectify()'s homography
+    target square is sized from marker_mm, so a wrong value here scales every
+    measured height on the whole image, not just the marker.
+
+    Returns a dict:
+        width_px, height_px   - original photo dimensions
+        tilt_spread_pct       - spread across the marker's 4 side lengths.
+                                 This is the aspect-ratio check CLAUDE.md rule 5
+                                 requires: an app that rectified the photo to a
+                                 fixed page aspect scales x and y differently,
+                                 which turns the marker's true square into a
+                                 non-square quadrilateral here.
+        capture_scale_ppm     - raw pixels-per-mm at the marker, pre-rectify
+        rows                  - [{"x","y","w","h","height_mm"}, ...] top-to-bottom
+
+    Raises MarkerNotFound if the image can't be read or no marker is visible.
+    """
+    bgr = cv2.imread(image_path)
+    if bgr is None:
+        raise MarkerNotFound(f"could not read {image_path}")
+
+    h, w = bgr.shape[:2]
+    pts = find_marker(bgr)
+    if pts is None:
+        raise MarkerNotFound(
+            "NO MARKER FOUND.\n"
+            "  - is the whole black square visible in the photo?\n"
+            "  - is the photo sharp? tap to focus before shooting\n"
+            "  - reduce screen glare; tilt the screen slightly")
+
+    sides = [np.linalg.norm(pts[i] - pts[(i + 1) % 4]) for i in range(4)]
+    ppm_raw = (sum(sides) / 4) / marker_mm
+    spread = (max(sides) - min(sides)) / max(sides) * 100
+
+    rect, ppm = rectify(bgr, pts, marker_mm=marker_mm, out_ppm=out_ppm)
+    rows, _ = text_rows(rect, ppm)
+
+    return {
+        "width_px": w,
+        "height_px": h,
+        "tilt_spread_pct": spread,
+        "capture_scale_ppm": ppm_raw,
+        "rows": [{"x": x, "y": y, "w": rw, "h": rh, "height_mm": rh / ppm}
+                for x, y, rw, rh in rows],
+    }
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit("usage: python measure_chart.py yourphoto.jpg")
-    bgr = cv2.imread(sys.argv[1])
-    if bgr is None:
-        sys.exit(f"could not read {sys.argv[1]}")
+    try:
+        result = measure(sys.argv[1])
+    except MarkerNotFound as e:
+        sys.exit(str(e))
 
-    H, W = bgr.shape[:2]
-    pts = find_marker(bgr)
-    if pts is None:
-        sys.exit("NO MARKER FOUND.\n"
-                 "  - is the whole black square visible in the photo?\n"
-                 "  - is the photo sharp? tap to focus before shooting\n"
-                 "  - reduce screen glare; tilt the screen slightly")
-
-    sides = [np.linalg.norm(pts[i] - pts[(i + 1) % 4]) for i in range(4)]
-    ppm_raw = (sum(sides) / 4) / MARKER_MM
-    spread = (max(sides) - min(sides)) / max(sides) * 100
-
+    W, H = result["width_px"], result["height_px"]
+    spread = result["tilt_spread_pct"]
     print(f"photo         : {W} x {H} px  ({W*H/1e6:.1f} MP)")
     print(f"marker found  : yes")
     print(f"tilt spread   : {spread:.1f} %  "
           f"({'ok' if spread < 8 else 'RESHOOT - too angled'})")
-    print(f"CAPTURE SCALE : {ppm_raw:.1f} px per mm")
+    print(f"CAPTURE SCALE : {result['capture_scale_ppm']:.1f} px per mm")
     print()
 
-    rect, ppm = rectify(bgr, pts)
-    rows, _ = text_rows(rect, ppm)
-
+    rows = result["rows"]
     print(f"found {len(rows)} text rows (expected {len(TEST_MM)})")
     print()
     print(f"{'true mm':>8} {'measured':>10} {'error':>9}   verdict")
@@ -131,8 +182,8 @@ def main():
 
     # rows come out top-to-bottom, same order the chart was drawn
     ok_floor = None
-    for true_mm, (x, y, w, h) in zip(TEST_MM, rows):
-        meas = h / ppm
+    for true_mm, row in zip(TEST_MM, rows):
+        meas = row["height_mm"]
         err = abs(meas - true_mm)
         good = err <= TOLERANCE_MM
         if good and ok_floor is None:
@@ -155,7 +206,7 @@ def main():
         print("   - too far away; fill the frame with the chart")
         print("   - screen glare washing out the text")
     print()
-    print(f"  capture scale was {ppm_raw:.1f} px/mm. Roughly 20 px/mm or better")
+    print(f"  capture scale was {result['capture_scale_ppm']:.1f} px/mm. Roughly 20 px/mm or better")
     print("  is where 1 mm text becomes comfortable to measure AND read.")
 
 

@@ -167,15 +167,24 @@ Ultralytics YOLO is AGPL-3.0 and is explicitly excluded.
 - [x] `.venv` created, `requirements.txt` pinned, `.env.example` with
       `OLLAMA_HOST`, `VLM_MODEL`
 - [x] `README.md` stub with the one-paragraph pitch
-- [ ] Refactor `vlm_extract.py` so its core is an importable function returning a
+- [x] Refactor `vlm_extract.py` so its core is an importable function returning a
       dict — not only a `__main__` that prints a table. The CLI keeps working by
       calling that function.
-- [ ] `POST /scan` — image in, structured fields plus verdict out
-- [ ] `POST /measure` — image plus marker size in, millimetre measurements out
-- [ ] Pydantic request/response models; error middleware mapping every model
+- [x] Refactor `measure_chart.py` the same way: extract a `measure()` function
+      reusable by the CLI and `POST /measure`. **Discovered while wiring
+      `POST /measure`:** `rectify()` hardcodes the 40 mm chart marker size via
+      the module constant `MARKER_MM` rather than accepting it as a parameter,
+      so passing a different marker size at the API boundary would silently
+      scale every millimetre reading wrong. Parameterize `rectify()`/`measure()`
+      on `marker_mm` (default stays 40.0 so the chart CLI path is unchanged).
+- [x] `POST /scan` — image in, structured fields plus verdict out
+- [x] `POST /measure` — image plus marker size in, millimetre measurements out
+- [x] Pydantic request/response models; error middleware mapping every model
       failure to a readable client error
-- [ ] **Gate: `/scan` returns the same fields for `oats.jpg` that the CLI does.**
-- [ ] **Commit:** `chore(init): repository scaffolding and existing vision engine`
+- [x] **Gate: `/scan` returns the same fields for `oats.jpg` that the CLI does.**
+      Verified: identical fields, states, problems and mandatory count from
+      both entry points, since both call the same `extract()` function.
+- [x] **Commit:** `chore(init): repository scaffolding and existing vision engine`
 - [ ] **Commit:** `feat(api): FastAPI service wrapping the vision engine`
 
 ### Phase B — Capture and results interface (30–31 Aug)
