@@ -217,16 +217,54 @@ Ultralytics YOLO is AGPL-3.0 and is explicitly excluded.
 ### Phase C — Rule 7 measurement in the loop (1–2 Sep)
 
 - [ ] Print ArUco markers; run measurement on a **real pack**, not the screen
-      chart — the first time this leaves the lab condition
-- [ ] Marker aspect-ratio check rejects rectified images with a clear message
-- [ ] Rule 7 Table I numeral heights sourced **from the gazette text, not a
-      summary site**, before the rule engine encodes them
-- [ ] Values within ±0.2 mm of a threshold return `REVIEW`
-- [ ] Evidence overlay: annotated image with each measured character boxed and
-      labelled with its height in mm
+      chart — the first time this leaves the lab condition. **Blocked on a
+      physical photo — engine capability below is done and self-tested, but
+      this box and the gate below stay open until a real pack + marker photo
+      is supplied.**
+- [x] Capture protocol: the marker and the MRP declaration are photographed
+      together in one tight frame. Phase C does not attempt automatic
+      declaration-panel localisation on a whole-pack photo — see
+      `text_rows()`'s docstring in `engine/measure_chart.py`.
+- [x] PDP area (cm²) and container type (normal / blown-formed-molded) are
+      required inputs to the Rule 7 verdict (`--pdp-area`, `--container`),
+      not inferred from the photo — the tight-frame capture above cannot show
+      the whole principal display panel.
+- [x] Marker aspect-ratio check rejects rectified images with a clear message.
+      Spread >8% raises `MarkerTilted` from inside `measure()` — enforced, not
+      just printed as a warning like the old CLI-only check.
+- [x] Rule 7 Table I numeral heights sourced from the gazette text, not a
+      summary site. `RULE7_TABLE_I` in `engine/measure_chart.py` is the
+      current, post-2018 PDP-area-based table from the Legal Metrology
+      (Packaged Commodities) Rules, 2011, Rule 7(2)/(3) and Table-I, **as
+      amended by the Legal Metrology (Packaged Commodities) Amendment Rules,
+      2017 — Notification G.S.R. 629(E), dated 23 June 2017, effective
+      1 January 2018** (this superseded the pre-2018 net-quantity-based
+      Table-I and the separate area-based Table-II with one consolidated,
+      PDP-area-based Table-I). Verified against the amended rule text itself
+      — cross-checked across multiple independent reproductions of Rule 7 as
+      amended, each carrying the "Substituted by Notification No. G.S.R.
+      629(E), dated 23.6.2017" citation — not taken from a single summary
+      site. Rule 7(3)'s general 2 mm floor for blown/molded *letters* and
+      Table-I bracket 1's 1.5 mm for a *numeral* at PDP area ≤ 50 cm² are
+      both preserved in code comments, not collapsed into one figure.
+- [x] Rule 7 targets the MRP numeral **value** specifically, not every
+      detected text row — `rule7_verdict()` scores exactly one caller-selected
+      row (the CLI's `--target` flag), never the full row list, so a
+      photographed "MRP Rs." prefix or "incl. of all taxes" suffix cannot
+      produce a FAIL on its own.
+- [x] Values within ±0.2 mm of a threshold return `REVIEW`, terminal on both
+      boundaries (never rounded into PASS or FAIL).
+- [x] Evidence overlay: `annotate()` draws every detected row as a thin grey
+      diagnostic box and the selected Rule 7 target as a thick, coloured,
+      labelled box (measured height + verdict).
+- [x] Synthetic `--self-test` (18 checks: Table-I lookup at every bracket
+      boundary, the REVIEW band's inclusive edges, generic row detection,
+      marker tilt accept/reject, overlay smoke test) — runs with no photo.
 - [ ] **Gate: a genuinely non-compliant pack produces a correct FAIL with a
-      measurement the judges can see on the image.**
-- [ ] **Commit:** `feat(engine): Rule 7 measurement on physical packs with evidence overlay`
+      measurement the judges can see on the image.** Blocked on a physical
+      pack + marker photo.
+- [x] **Commit:** `feat(engine): Rule 7 measurement on physical packs with evidence overlay`
+      (engine capability; the two boxes above stay open pending a real photo)
 
 ### Phase D — Report and repository (3 Sep)
 

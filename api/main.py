@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from engine.vlm_extract import BackendError, ExtractionFailed, extract
-from engine.measure_chart import MarkerNotFound, measure
+from engine.measure_chart import MarkerNotFound, MarkerTilted, measure
 
 from api.models import MeasureResponse, ScanResponse
 
@@ -61,6 +61,11 @@ async def extraction_failed_handler(request, exc):
 
 @app.exception_handler(MarkerNotFound)
 async def marker_not_found_handler(request, exc):
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(MarkerTilted)
+async def marker_tilted_handler(request, exc):
     return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
