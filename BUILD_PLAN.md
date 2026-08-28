@@ -156,15 +156,17 @@ Ultralytics YOLO is AGPL-3.0 and is explicitly excluded.
 
 ### Phase A — Repository and API contract (28–29 Aug)
 
-- [ ] `git init`, `main` branch, `.gitignore` for Python and Node
-- [ ] Move existing scripts into `engine/`: `measure_chart.py`, `extract.py`,
+- [x] `git init`, `main` branch, `.gitignore` for Python and Node
+- [x] Move existing scripts into `engine/`: `measure_chart.py`, `extract.py`,
       `vlm_extract.py`, `preprocess.py`, `batch.py`, `make_screen_chart.py`
-- [ ] **Re-run the full 10-pack corpus after the move and before the first
+      (`preprocess.py` and `make_screen_chart.py` do not exist in this repo —
+      everything that exists has been moved)
+- [x] **Re-run the full 10-pack corpus after the move and before the first
       commit.** Moving files breaks relative paths; the first commit must be a
       working tree.
-- [ ] `.venv` created, `requirements.txt` pinned, `.env.example` with
+- [x] `.venv` created, `requirements.txt` pinned, `.env.example` with
       `OLLAMA_HOST`, `VLM_MODEL`
-- [ ] `README.md` stub with the one-paragraph pitch
+- [x] `README.md` stub with the one-paragraph pitch
 - [ ] Refactor `vlm_extract.py` so its core is an importable function returning a
       dict — not only a `__main__` that prints a table. The CLI keeps working by
       calling that function.

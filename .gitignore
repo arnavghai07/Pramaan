@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# environment
+.env
+
+# Node / Next.js (web/ arrives in Phase B)
+node_modules/
+.next/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
