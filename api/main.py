@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from engine.vlm_extract import BackendError, ExtractionFailed, extract
@@ -30,6 +31,17 @@ from engine.measure_chart import MarkerNotFound, measure
 from api.models import MeasureResponse, ScanResponse
 
 app = FastAPI(title="PRAMAAN", version="0.1.0")
+
+# The Next.js dev server (web/) calls this API from a different origin, and a
+# browser fetch is blocked client-side without this even though the server
+# still returns 200 — curl doesn't enforce CORS, so this gap is invisible
+# from the CLI/curl gates Phase A used.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DEFAULT_MODEL = os.environ.get("VLM_MODEL", "qwen2.5vl:7b")
 

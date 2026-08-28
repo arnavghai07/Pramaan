@@ -185,21 +185,34 @@ Ultralytics YOLO is AGPL-3.0 and is explicitly excluded.
       Verified: identical fields, states, problems and mandatory count from
       both entry points, since both call the same `extract()` function.
 - [x] **Commit:** `chore(init): repository scaffolding and existing vision engine`
-- [ ] **Commit:** `feat(api): FastAPI service wrapping the vision engine`
+- [x] **Commit:** `feat(api): FastAPI service wrapping the vision engine`
 
 ### Phase B — Capture and results interface (30–31 Aug)
 
-- [ ] Next.js 15 app in `web/`, Tailwind and shadcn/ui configured
-- [ ] Capture screen: `getUserMedia` live view, framing guide, file-upload
+- [x] Next.js 15 app in `web/`, Tailwind and shadcn/ui configured
+- [x] Capture screen: `getUserMedia` live view, framing guide, file-upload
       fallback (**the fallback is the demo path — never rely on venue lighting
       or a browser camera permission prompt on stage**)
-- [ ] Results view: field table with PRESENT / MISSING / REVIEW states, verdict
+- [x] Results view: field table with PRESENT / MISSING / REVIEW states, verdict
       banner, mandatory fields visually separated from optional ones
-- [ ] Loading skeletons and error states — a scan takes seconds and a frozen
+- [x] Loading skeletons and error states — a scan takes seconds and a frozen
       screen reads as a crash
-- [ ] Mobile-responsive layout
-- [ ] **Gate: photograph a pack, see a verdict, end to end, in the browser.**
-- [ ] **Commit:** `feat(ui): capture and results interface`
+- [x] Mobile-responsive layout. **Discovered while checking a phone viewport:**
+      a fixed 3-column table can't fit a long `address` value plus a state
+      badge on a narrow screen without clipping one of them — the badge
+      rendered off-card. `FieldTable` now renders a real table at `sm:` and
+      up and a stacked field/value/badge list below it.
+- [x] **Gate: photograph a pack, see a verdict, end to end, in the browser.**
+      Verified with a real corpus photo (`oats.jpg`) driven through an actual
+      browser (not just curl): capture → upload fallback → loading skeleton →
+      results with a REVIEW verdict banner, 6/6 mandatory fields, and the
+      illegible `unit_sale_price` problem listed, at both desktop and
+      mobile (390px) viewports. **Discovered during this gate:**
+      `api/main.py` had no CORS headers — the browser silently blocked the
+      `/scan` response even though the server logged 200 OK, invisible to
+      curl since curl doesn't enforce CORS. Fixed by adding `CORSMiddleware`
+      allowing `http://localhost:3000`.
+- [x] **Commit:** `feat(ui): capture and results interface`
 
 ### Phase C — Rule 7 measurement in the loop (1–2 Sep)
 
