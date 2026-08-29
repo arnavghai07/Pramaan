@@ -216,11 +216,13 @@ Ultralytics YOLO is AGPL-3.0 and is explicitly excluded.
 
 ### Phase C — Rule 7 measurement in the loop (1–2 Sep)
 
-- [ ] Print ArUco markers; run measurement on a **real pack**, not the screen
-      chart — the first time this leaves the lab condition. **Blocked on a
-      physical photo — engine capability below is done and self-tested, but
-      this box and the gate below stay open until a real pack + marker photo
-      is supplied.**
+- [x] Print ArUco markers; run measurement on a **real pack**, not the screen
+      chart — the first time this leaves the lab condition. Done: `pt.jpg`,
+      a genuine printed 28 mm marker photographed beside the MRP declaration
+      on a real cosmetics carton. Marker detected, tilt spread 1.6% (passed
+      the >8% rejection gate), MRP numeral ("₹645.00") isolated and measured
+      at 2.35 mm against a 1.5 mm Table-I threshold (77 cm² PDP, normal
+      print) — **PASS**.
 - [x] Capture protocol: the marker and the MRP declaration are photographed
       together in one tight frame. Phase C does not attempt automatic
       declaration-panel localisation on a whole-pack photo — see
@@ -261,10 +263,28 @@ Ultralytics YOLO is AGPL-3.0 and is explicitly excluded.
       boundary, the REVIEW band's inclusive edges, generic row detection,
       marker tilt accept/reject, overlay smoke test) — runs with no photo.
 - [ ] **Gate: a genuinely non-compliant pack produces a correct FAIL with a
-      measurement the judges can see on the image.** Blocked on a physical
-      pack + marker photo.
+      measurement the judges can see on the image.** Still open. `pt.jpg`
+      proves the pipeline works on a real, physical pack, but it is
+      compliant (PASS) — it does not exercise the FAIL path. Neither
+      CLAUDE.md nor this gate's own wording ("a genuinely non-compliant
+      **pack**") permits a generated image to stand in for one; a real,
+      physically non-compliant pack + marker photo is still required to
+      close this box.
+    - *Synthetic pipeline test — does NOT satisfy this gate, recorded for
+      engineering reference only.* A generated fixture (genuine
+      `DICT_4X4_50` ID-0 marker, `--marker-mm 28`, deliberately undersized
+      "₹52.00" numeral) was run through the unmodified engine:
+      0.60 mm measured against a 1.0 mm threshold (21.6 cm² PDP, normal;
+      REVIEW band 0.8–1.2 mm) — **FAIL**, with an evidence overlay. This
+      confirms `rule7_verdict()`'s FAIL path is mechanically correct; it
+      says nothing about real print, real camera capture, or a real pack,
+      and must not be cited as physical-pack evidence.
 - [x] **Commit:** `feat(engine): Rule 7 measurement on physical packs with evidence overlay`
-      (engine capability; the two boxes above stay open pending a real photo)
+      (engine capability: generalized measurement, enforced tilt gate,
+      Table-I verdict, evidence overlay, self-test)
+- [ ] **Commit:** `docs(build-plan): record pt.jpg real-pack PASS and
+      synthetic FAIL pipeline evidence for Phase C` (this update — not yet
+      committed)
 
 ### Phase D — Report and repository (3 Sep)
 
