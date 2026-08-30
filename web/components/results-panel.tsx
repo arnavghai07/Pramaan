@@ -9,25 +9,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { deriveVerdict, type FieldRow, type ScanResponse } from "@/lib/api";
-
-const VERDICT_STYLES: Record<
-  ReturnType<typeof deriveVerdict>,
-  { label: string; className: string }
-> = {
-  OK: {
-    label: "COMPLIANT — all mandatory declarations present",
-    className: "bg-green-600 text-white border-green-700",
-  },
-  REVIEW: {
-    label: "REVIEW NEEDED — an officer must confirm flagged fields",
-    className: "bg-amber-500 text-white border-amber-600",
-  },
-  FAIL: {
-    label: "NON-COMPLIANT — mandatory declaration(s) missing",
-    className: "bg-red-600 text-white border-red-700",
-  },
-};
+import type { FieldRow, ScanResponse } from "@/lib/api";
 
 const STATE_BADGE: Record<FieldRow["state"], string> = {
   PRESENT: "bg-green-100 text-green-800 border-green-300",
@@ -91,19 +73,20 @@ function FieldTable({ rows }: { rows: FieldRow[] }) {
   );
 }
 
+/**
+ * Renders the Rule 6 field table and cross-check problems for one scan.
+ * The overall compliance banner is StatusBanner, driven by the server's
+ * combine_status() result — this component only shows what was extracted,
+ * never a verdict of its own.
+ */
 export function ResultsPanel({ result }: { result: ScanResponse }) {
-  const verdict = deriveVerdict(result);
-  const style = VERDICT_STYLES[verdict];
   const mandatoryRows = result.rows.filter((r) => r.mandatory);
   const optionalRows = result.rows.filter((r) => !r.mandatory);
 
   return (
     <div className="flex flex-col gap-6 w-full max-w-2xl mx-auto">
-      <div className={`rounded-lg border px-4 py-3 font-semibold ${style.className}`}>
-        {style.label}
-        <span className="ml-2 font-normal opacity-90">
-          ({result.mandatory_present}/{result.mandatory_total} mandatory fields present)
-        </span>
+      <div className="text-sm text-muted-foreground">
+        {result.mandatory_present}/{result.mandatory_total} mandatory declarations detected
       </div>
 
       {result.problems.length > 0 && (

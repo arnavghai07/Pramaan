@@ -27,13 +27,27 @@ interface ApiErrorBody {
   orientations_tried?: string[];
 }
 
+const SERVICE_UNAVAILABLE_MESSAGE =
+  "Inspection service is temporarily unavailable. Please try again.";
+const ANALYSIS_FAILED_MESSAGE =
+  "Analysis could not be completed. Please retry with a clearer image.";
+
 export class ScanError extends Error {
   orientationsTried?: string[];
+  /**
+   * Short, professional message safe to show as the primary UI text.
+   * `message` (inherited from Error) keeps the raw backend/model detail —
+   * useful in the browser console for debugging, but never meant to reach
+   * the screen directly: a raw Ollama/JSON/Windows-path error dump reads as
+   * a crash to a judge, not a status.
+   */
+  friendlyMessage: string;
 
-  constructor(detail: string, orientationsTried?: string[]) {
+  constructor(detail: string, orientationsTried?: string[], friendlyMessage?: string) {
     super(detail);
     this.name = "ScanError";
     this.orientationsTried = orientationsTried;
+    this.friendlyMessage = friendlyMessage ?? ANALYSIS_FAILED_MESSAGE;
   }
 }
 
@@ -51,7 +65,9 @@ export async function scanImage(
     res = await fetch(`${API_URL}/scan`, { method: "POST", body: form });
   } catch {
     throw new ScanError(
-      `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`
+      `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`,
+      undefined,
+      SERVICE_UNAVAILABLE_MESSAGE
     );
   }
 
@@ -74,9 +90,221 @@ export type Verdict = "OK" | "REVIEW" | "FAIL";
  * A problem (illegible field, cross-check mismatch) means the engine isn't
  * confident, which outranks a plain missing-field count: CLAUDE.md rule 3,
  * "confident wrong beats nothing is false" — REVIEW before FAIL.
+ *
+ * Kept for callers that only ever hit /scan directly (e.g. the CLI-parity
+ * gate). The unified workflow below gets its status from the server
+ * (engine/verdict.py's combine_status()) instead of recomputing it here —
+ * CLAUDE.md rule 1, the verdict is never decided in a UI component.
  */
 export function deriveVerdict(result: ScanResponse): Verdict {
   if (result.problems.length > 0) return "REVIEW";
   if (result.mandatory_present < result.mandatory_total) return "FAIL";
   return "OK";
+}
+
+// ---------------------------------------------------------------------------
+// Phase D — unified inspection (Rule 6 + Rule 7 combined verdict)
+// ---------------------------------------------------------------------------
+
+export interface Rule7Row {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  height_mm: number;
+}
+
+export interface CandidatesResponse {
+  tilt_spread_pct: number;
+  capture_scale_ppm: number;
+  rows: Rule7Row[];
+  overlay_png_base64: string;
+}
+
+/**
+ * Rule 7's contribution to a combined inspection. There is deliberately no
+ * "target index" here — see rule7-panel.tsx, which resolves a tap on the
+ * candidate overlay to a row internally and never surfaces the concept of
+ * an index to the inspector. "manual_region" is the fallback path: the
+ * inspector drew a rectangle because no automatic candidate cleanly
+ * bounded the complete numeral — see rule7_measure_selected_region()'s
+ * docstring in engine/measure_chart.py for why the rectangle itself is
+ * never the reported measurement.
+ */
+export interface Rule7Result {
+  attempted: boolean;
+  problem: string | null;
+  tilt_spread_pct: number | null;
+  capture_scale_ppm: number | null;
+  rows: Rule7Row[];
+  measured_height_mm: number | null;
+  threshold_mm: number | null;
+  verdict: "PASS" | "FAIL" | "REVIEW" | null;
+  selection_method: "manual" | "manual_region" | "auto" | null;
+  overlay_png_base64: string | null;
+}
+
+/** A rectangle in one orientation's rectified-frame pixel coordinates. */
+export interface Rule7Region {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export type OverallStatus = "COMPLIANT" | "NON_COMPLIANT" | "NEEDS_MANUAL_REVIEW";
+
+export interface InspectionResponse {
+  rule6: ScanResponse;
+  rule7: Rule7Result | null;
+  overall_status: OverallStatus;
+  findings: string[];
+}
+
+async function readApiError(res: Response): Promise<ScanError> {
+  let body: ApiErrorBody = { detail: `Request failed (HTTP ${res.status})` };
+  try {
+    body = await res.json();
+  } catch {
+    // Non-JSON error body — keep the generic message set above.
+  }
+  return new ScanError(body.detail, body.orientations_tried);
+}
+
+/**
+ * Rule 7 candidate rows on a photo, with no target chosen — drives the
+ * "tap the price" picker in rule7-panel.tsx. Internally this is a plain
+ * POST /measure/candidates call; nothing here talks about row indices.
+ */
+export async function getRule7Candidates(
+  image: File | Blob,
+  filename = "rule7.jpg",
+  markerMm = 40.0
+): Promise<CandidatesResponse> {
+  const form = new FormData();
+  form.append("image", image, filename);
+  form.append("marker_mm", String(markerMm));
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/measure/candidates`, { method: "POST", body: form });
+  } catch {
+    throw new ScanError(
+      `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`,
+      undefined,
+      SERVICE_UNAVAILABLE_MESSAGE
+    );
+  }
+  if (!res.ok) throw await readApiError(res);
+  return res.json();
+}
+
+/**
+ * Preview the FALLBACK manual-region measurement — mirrors
+ * getRule7Candidates() above, but for a hand-drawn rectangle instead of a
+ * tapped candidate. Lets the UI show the trimmed-glyph evidence (or an
+ * "ambiguous"/"nothing found" outcome) before the inspector commits to the
+ * full inspectPack() call.
+ */
+export async function getRule7RegionMeasurement(
+  image: File | Blob,
+  filename: string,
+  markerMm: number,
+  rotationDeg: number,
+  region: Rule7Region,
+  pdpAreaCm2?: number,
+  container: "normal" | "blown" = "normal"
+): Promise<Rule7Result> {
+  const form = new FormData();
+  form.append("image", image, filename);
+  form.append("marker_mm", String(markerMm));
+  form.append("rotation_deg", String(rotationDeg));
+  form.append("region_x", String(Math.round(region.x)));
+  form.append("region_y", String(Math.round(region.y)));
+  form.append("region_w", String(Math.round(region.w)));
+  form.append("region_h", String(Math.round(region.h)));
+  if (pdpAreaCm2 != null) form.append("pdp_area_cm2", String(pdpAreaCm2));
+  form.append("container", container);
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/measure/region`, { method: "POST", body: form });
+  } catch {
+    throw new ScanError(
+      `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`,
+      undefined,
+      SERVICE_UNAVAILABLE_MESSAGE
+    );
+  }
+  if (!res.ok) throw await readApiError(res);
+  return res.json();
+}
+
+export interface InspectParams {
+  rule6Image?: File | Blob;
+  rule6Filename?: string;
+  /**
+   * A Rule 6 result this client already received from an earlier call
+   * (initial scan), sent back instead of the photo so the server can skip
+   * re-running VLM extraction. Takes priority over rule6Image when both are
+   * set — see inspectPack()'s doc comment.
+   */
+  rule6Result?: ScanResponse;
+  rule7Image?: File | Blob;
+  rule7Filename?: string;
+  markerMm?: number;
+  pdpAreaCm2?: number;
+  container?: "normal" | "blown";
+  /** Internal selection mechanism — see Rule7Result's doc comment. */
+  targetIndex?: number;
+  /** Fallback selection mechanism — takes priority over targetIndex if both are set. */
+  region?: Rule7Region;
+  rotationDeg?: number;
+}
+
+/**
+ * The unified workflow entry point: Rule 6 declarations plus an optional
+ * Rule 7 measurement, combined server-side into one overall_status.
+ *
+ * Exactly one of rule6Image / rule6Result should be given. Use rule6Image
+ * for an initial scan (Rule 6 has not run yet). Use rule6Result when Rule 6
+ * already ran earlier in this session and you're only adding a Rule 7
+ * measurement — passing the already-known result avoids paying for a
+ * second, identical VLM inference on the same photo.
+ */
+export async function inspectPack(params: InspectParams): Promise<InspectionResponse> {
+  const form = new FormData();
+  if (params.rule6Result) {
+    form.append("rule6_result", JSON.stringify(params.rule6Result));
+  } else if (params.rule6Image) {
+    form.append("rule6_image", params.rule6Image, params.rule6Filename ?? "capture.jpg");
+  }
+  if (params.rule7Image) {
+    form.append("rule7_image", params.rule7Image, params.rule7Filename ?? "rule7.jpg");
+    form.append("marker_mm", String(params.markerMm ?? 40.0));
+    if (params.pdpAreaCm2 != null) form.append("pdp_area_cm2", String(params.pdpAreaCm2));
+    if (params.container) form.append("container", params.container);
+    if (params.region) {
+      form.append("rotation_deg", String(params.rotationDeg ?? 0));
+      form.append("region_x", String(Math.round(params.region.x)));
+      form.append("region_y", String(Math.round(params.region.y)));
+      form.append("region_w", String(Math.round(params.region.w)));
+      form.append("region_h", String(Math.round(params.region.h)));
+    } else if (params.targetIndex != null) {
+      form.append("target_index", String(params.targetIndex));
+    }
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/inspect`, { method: "POST", body: form });
+  } catch {
+    throw new ScanError(
+      `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`,
+      undefined,
+      SERVICE_UNAVAILABLE_MESSAGE
+    );
+  }
+  if (!res.ok) throw await readApiError(res);
+  return res.json();
 }

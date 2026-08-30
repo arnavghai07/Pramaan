@@ -419,6 +419,501 @@ def run_pack_mode(args):
     print(f"\nevidence overlay saved: {out_path}")
 
 
+def rule7_result(image_path, marker_mm=MARKER_MM, pdp_area_cm2=None,
+                 container="normal", target_index=None):
+    """
+    HTTP-friendly wrapper around measure() + rule7_verdict() + annotate().
+
+    This does exactly what run_pack_mode() already does for the CLI, minus
+    the printing and file-writing: it calls measure(), rule7_verdict() and
+    annotate() unmodified and returns their results as data (the overlay as
+    PNG bytes) so api/main.py can serve them over POST /inspect and
+    POST /measure/candidates without touching disk.
+
+    target_index selects which detected row (from measure()'s "rows" list)
+    is the Rule 7 measurement target - the same role --target plays on the
+    CLI. Deliberately kept a plain optional index, not a semantic concept:
+    today a caller (the UI) resolves it by asking an inspector to point at
+    the printed price; a later automatic MRP-numeral identification pass
+    only needs to change how target_index gets filled in before this
+    function is called; it does not change this function's contract. When
+    target_index is None (no target chosen yet, e.g. showing measurement
+    candidates before a selection is made), the verdict/threshold both come
+    back None and the overlay draws every candidate row unhighlighted - this
+    is the same "no --target given" state run_pack_mode already prints.
+
+    Returns:
+        {
+          "tilt_spread_pct", "capture_scale_ppm": as measure() returns,
+          "rows":                                 as measure() returns,
+          "target_index":                         echoed back, or None,
+          "threshold_mm", "verdict":               None unless both
+                                                    target_index and
+                                                    pdp_area_cm2 are given,
+          "overlay_png":                          PNG-encoded bytes, or
+                                                    None if cv2.imencode
+                                                    somehow fails,
+        }
+
+    Raises MarkerNotFound / MarkerTilted, exactly as measure() does.
+    Raises ValueError if target_index is given but out of range for the
+    rows measure() found - the same bounds check the CLI performs before
+    calling rule7_verdict().
+    """
+    result = measure(image_path, marker_mm=marker_mm, chart_columns=False)
+    rows = result["rows"]
+
+    verdict = threshold_mm = None
+    if target_index is not None:
+        if not (0 <= target_index < len(rows)):
+            raise ValueError(
+                f"target_index {target_index} is out of range (0..{len(rows) - 1})")
+        if pdp_area_cm2 is not None:
+            height_mm = rows[target_index]["height_mm"]
+            threshold_mm, verdict = rule7_verdict(height_mm, pdp_area_cm2, container)
+
+    # Re-detect the marker to get the rectified image for the overlay -
+    # measure() deliberately does not return it, same reasoning as
+    # run_pack_mode()'s identical re-detection above.
+    bgr = cv2.imread(image_path)
+    pts = find_marker(bgr)
+    rect, _ = rectify(bgr, pts, marker_mm=marker_mm)
+    overlay = annotate(rect, rows, target_index, verdict, threshold_mm)
+    ok, buf = cv2.imencode(".png", overlay)
+
+    return {
+        "tilt_spread_pct": result["tilt_spread_pct"],
+        "capture_scale_ppm": result["capture_scale_ppm"],
+        "rows": rows,
+        "target_index": target_index,
+        "threshold_mm": threshold_mm,
+        "verdict": verdict,
+        "overlay_png": buf.tobytes() if ok else None,
+    }
+
+
+_ROTATIONS = {0: None, 90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+             270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
+
+def rule7_candidates_all_orientations(image_path, marker_mm=MARKER_MM):
+    """
+    Rule 7 candidate rows across every 90-degree orientation of the
+    rectified frame - not just the single orientation measure() happens to
+    produce.
+
+    WHY THIS EXISTS
+    ----------------
+    text_rows()'s character-joining dilation only bridges gaps along the
+    rectified frame's horizontal axis (see its own comment: "join
+    characters into words/lines but do not bridge separate rows" - the
+    dilation kernel is (3*ppm, 1), one pixel tall). rectify()'s output
+    orientation is fixed by the ArUco marker's own encoded corner order,
+    not by the pack's print direction. So when the physical marker happens
+    to be taped rotated in-plane relative to the printed text - a real,
+    observed case, not a hypothetical: a genuine walnut-pack photo with the
+    marker rotated roughly 90 degrees relative to its MRP declaration - a
+    price that should measure as one row instead fragments into separate
+    per-digit boxes, because the gaps between digits now run along the axis
+    the dilation cannot bridge. pt.jpg never had this problem because its
+    marker happened to be oriented in-line with the print.
+
+    This function does not decide which orientation is "correct" -
+    CLAUDE.md rule 1, nothing here judges or selects. It calls the
+    UNMODIFIED text_rows() at 0/90/180/270 degrees of the same rectified
+    pixels measure() already produces, and returns every orientation's
+    candidates side by side. find_marker(), rectify(), measure(),
+    text_rows(), rule7_lookup(), rule7_verdict() and annotate() are called
+    exactly as they already exist - none of them are touched, and the tilt
+    gate is enforced exactly once, by measure() itself, which this
+    function calls for that purpose (so a tilted marker still raises
+    MarkerTilted here as it always has, before any orientation is tried).
+
+    The existing target-selection workflow (a human picks the row that is
+    the MRP numeral) is unchanged in kind: it now simply has more than one
+    orientation's candidate list to choose from, the same way an inspector
+    already chooses among several rows within one orientation. A candidate
+    that happens to merge the MRP with an adjacent declaration (observed on
+    the walnut photo at 90 degrees, where the dilation reached far enough
+    to bridge MRP and USP together) is exactly the kind of thing this
+    function must surface, not filter or silently prefer - a human decides
+    it is not the right box, the same way they would reject any other wrong
+    candidate.
+
+    Returns:
+        {
+          "tilt_spread_pct":    from measure() - one calibration, not
+                                repeated per orientation,
+          "capture_scale_ppm":  from measure() - ditto,
+          "orientations": [
+              {"rotation_deg": 0,   "rows": [...]},   # identical to
+                                                       # measure()'s own
+                                                       # rows - not recomputed
+              {"rotation_deg": 90,  "rows": [...]},
+              {"rotation_deg": 180, "rows": [...]},
+              {"rotation_deg": 270, "rows": [...]},
+          ],
+        }
+
+    Each row dict has the same "x","y","w","h","height_mm" shape measure()
+    already returns, expressed in THAT orientation's own rectified-pixel
+    coordinates - a caller rendering an overlay for orientation N must
+    annotate a frame rotated to orientation N, not the 0-degree frame (see
+    rule7_overlay_for_orientation() below, which does exactly that).
+
+    Raises MarkerNotFound / MarkerTilted exactly as measure() does.
+    """
+    base = measure(image_path, marker_mm=marker_mm, chart_columns=False)
+
+    bgr = cv2.imread(image_path)
+    pts = find_marker(bgr)
+    rect, ppm = rectify(bgr, pts, marker_mm=marker_mm)
+
+    orientations = []
+    for deg, code in _ROTATIONS.items():
+        if deg == 0:
+            rows = base["rows"]                       # reuse - do not redo measure()'s work
+        else:
+            rotated = cv2.rotate(rect, code)
+            raw_rows, _ = text_rows(rotated, ppm, chart_columns=False)
+            rows = [{"x": x, "y": y, "w": w, "h": h, "height_mm": h / ppm}
+                    for x, y, w, h in raw_rows]
+        orientations.append({"rotation_deg": deg, "rows": rows})
+
+    return {
+        "tilt_spread_pct": base["tilt_spread_pct"],
+        "capture_scale_ppm": base["capture_scale_ppm"],
+        "orientations": orientations,
+    }
+
+
+def rule7_overlay_for_orientation(image_path, marker_mm, rotation_deg, rows,
+                                  target_index=None, verdict=None, threshold_mm=None):
+    """
+    Evidence overlay for one orientation's candidate rows - a thin wrapper
+    around the UNMODIFIED annotate(), rotating the rectified frame to match
+    the orientation `rows` was computed in (see
+    rule7_candidates_all_orientations() above). Exists so a caller can
+    show, and let a human pick from, 0/90/180/270-degree candidate sets
+    without reimplementing annotate()'s drawing logic.
+
+    target_index/verdict/threshold_mm are passed straight through to
+    annotate(); leave them None to render every row unhighlighted, exactly
+    as annotate() already does when no target has been chosen yet.
+    """
+    bgr = cv2.imread(image_path)
+    pts = find_marker(bgr)
+    rect, _ = rectify(bgr, pts, marker_mm=marker_mm)
+    code = _ROTATIONS[rotation_deg]
+    frame = rect if code is None else cv2.rotate(rect, code)
+    overlay = annotate(frame, rows, target_index, verdict, threshold_mm)
+    ok, buf = cv2.imencode(".png", overlay)
+    return buf.tobytes() if ok else None
+
+
+def _locate_target(crop, box_w, ppm):
+    """
+    Cluster a (cropped) binary threshold image into candidate glyphs and
+    pick the one closest to the crop's own horizontal center. Factored out
+    of rule7_measure_selected_region() so the SAME rule can be applied
+    twice - once to an inspector's raw selection, then again to that
+    selection's own detected target for refinement - without risking two
+    copies of the logic drifting apart.
+
+    Reuses text_rows()'s own horizontal-joining kernel and noise floor -
+    not a second, incompatible detector - so every character of one
+    printed value (e.g. "400.00") joins into a single candidate the same
+    way text_rows() already joins them on the whole frame. The kernel is
+    one row tall, so it can only spread ink sideways - it can never create
+    ink in a row that had none, which is what lets height be re-measured
+    from the undilated pixels without the dilation itself inflating
+    anything.
+
+    Returns (status, payload, num_clusters):
+      "target", (cx, cy, cw, ch, cy0, cy1), N
+          Exactly one confident cluster. (cx, cy, cw, ch) is its DILATED
+          bounding box, in `crop`'s own coordinates - used only to know
+          which pixels belong together, never to measure height.
+          (cy0, cy1) is its ORIGINAL, UNDILATED ink extent (row indices in
+          `crop`), restricted to BOTH that cluster's column span AND its
+          own row span - restricting by column alone previously let an
+          already-separated, vertically stacked print line (a real case:
+          a USP value printed directly beneath the MRP, almost touching
+          it) bleed back into the measurement even though the clustering
+          above had already told the two lines apart; confirmed on that
+          real selection, column-only restriction measured 4.70mm by
+          scanning nearly the whole selection instead of the ~2.8mm the
+          MRP cluster's own bounding box actually covered. N is the total
+          number of candidate clusters found (including ones not chosen).
+      "ambiguous", ranked, N
+          Two or more clusters at similarly central positions - genuinely
+          unclear which is intended. `ranked` lists every surviving
+          cluster, closest-to-center first.
+      "none", None, 0
+          No cluster survived the noise filter.
+    """
+    ker = cv2.getStructuringElement(cv2.MORPH_RECT, (int(3 * ppm), 1))
+    joined = cv2.dilate(crop, ker, iterations=1)
+    cnts, _ = cv2.findContours(joined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    clusters = []
+    for c in cnts:
+        cx, cy, cw, ch = cv2.boundingRect(c)
+        if cw < 1.2 * ppm or ch < 0.4 * ppm:    # same noise floor text_rows() uses
+            continue
+        clusters.append((cx, cy, cw, ch))
+
+    if not clusters:
+        return "none", None, 0
+
+    crop_center_x = box_w / 2.0
+    ranked = sorted(clusters, key=lambda c: abs((c[0] + c[2] / 2.0) - crop_center_x))
+    best_dist = abs((ranked[0][0] + ranked[0][2] / 2.0) - crop_center_x)
+
+    # A second candidate about equally close to the selection's center is
+    # genuinely ambiguous, not a tie to break silently - CLAUDE.md rule 3,
+    # this never guesses among options a human would find equally
+    # plausible.
+    ambiguous = False
+    if len(ranked) > 1:
+        second_dist = abs((ranked[1][0] + ranked[1][2] / 2.0) - crop_center_x)
+        ambiguous = (second_dist - best_dist) < 1.2 * ppm
+
+    if ambiguous:
+        return "ambiguous", ranked, len(ranked)
+
+    cx, cy, cw, ch = ranked[0]
+    sub = crop[cy:cy + ch, cx:cx + cw]
+    ink_rows = np.where((sub > 0).any(axis=1))[0]
+    if ink_rows.size == 0:
+        return "none", None, len(clusters)
+    cy0 = cy + int(ink_rows.min())
+    cy1 = cy + int(ink_rows.max())
+    return "target", (cx, cy, cw, ch, cy0, cy1), len(clusters)
+
+
+def rule7_measure_selected_region(image_path, marker_mm, rotation_deg, region,
+                                  pdp_area_cm2=None, container="normal",
+                                  gap_ppm_fraction=0.3):
+    """
+    FALLBACK Rule 7 measurement, used only when automatic candidate
+    discovery (rule7_candidates_all_orientations()) cannot isolate a clean,
+    complete numeral - observed on two real photographs of the same real
+    pack: text_rows()'s fixed-width character-joining dilation either
+    fragments a multi-digit price into separate digits, or (a different,
+    also-observed failure) over-merges it with an adjacent declaration
+    printed close by (USP, batch number). Automatic discovery remains the
+    first path always - this function is never called until an inspector
+    has already looked at the automatic candidates and found none clean.
+
+    WHY THE RECTANGLE ITSELF IS NEVER TRUSTED
+    -------------------------------------------
+    CLAUDE.md rule 3 - confident wrong beats nothing is false - applies as
+    much to a hand-drawn box as to a model's guess. An inspector's
+    selection is realistically generous (padding above/below/around the
+    print), so its raw height is not the character height. Confirmed on a
+    real selection: a generous box around a real "400.00" measured 5.5mm
+    as a rectangle but 2.45mm of actual ink - using the rectangle would
+    have been more than double the true value.
+
+    HOW THE SELECTION IS MEASURED
+    -------------------------------
+    This crops the SAME raw, un-dilated binary threshold text_rows()
+    already computes and returns as its second value
+    (`rows, th = text_rows(...)`) - no new thresholding pipeline, so this
+    can never disagree with the automatic path about what counts as "ink".
+
+    An earlier version of this function measured height with a plain
+    row-wise ink projection across the FULL WIDTH of the selection: any
+    threshold pixel anywhere in a row - a table border, a neighbouring
+    column's character, a decimal point - made that row count as
+    "occupied", silently pulling the measured extent toward whatever else
+    happened to be inside the box's horizontal span. Confirmed on a real
+    selection: the same printed "400.00" measured anywhere from 2.60mm to
+    4.70mm purely from drawing a slightly wider or taller box around it -
+    a deterministic consequence of that projection having no concept of
+    which pixels belonged to which character, not camera noise.
+
+    This version instead clusters the selection's ink into candidate
+    GLYPHS before measuring anything (see _locate_target() above for the
+    exact rule), and picks the candidate closest to the selection's own
+    center. Its height is then re-measured from the ORIGINAL, UNDILATED
+    threshold pixels within that candidate's own bounding box - both its
+    column span AND its row span, never from the dilated image and never
+    from anything outside the chosen cluster's own extent.
+
+    Neighbouring print (an adjacent column, a table border, another line)
+    is not silently absorbed the way the old row-projection could absorb
+    it: it only joins the target's cluster if the two are close enough for
+    the joining dilation to actually bridge them - the same, already-
+    accepted risk text_rows() itself carries on the automatic path - and
+    otherwise remains its own separate, off-center candidate that is
+    correctly ignored, or triggers the ambiguous outcome if it lands close
+    to center.
+
+    ITERATIVE REFINEMENT (stability against how generously the box is drawn)
+    ---------------------------------------------------------------------
+    A single confident pass already never trusts the rectangle's own size,
+    but it can still be sensitive to exactly how much blank margin, or how
+    much of a barely-touching neighbour, the inspector's own box happens
+    to include on its very first try - confirmed on a real pack: boxes
+    that all looked like "a reasonable selection around the MRP" measured
+    anywhere from 2.10mm to 4.70mm before this refinement, purely from
+    small differences in the drawn rectangle.
+
+    So once a CONFIDENT single target is found, this re-applies
+    _locate_target() to that target's own bounding box - zero added
+    margin (a small margin was tested and found to actively prevent
+    convergence, letting the box slowly regrow and drift on each pass
+    instead of stabilizing) - for at most two more passes, stopping the
+    moment the box stops changing. Confirmed empirically: differently
+    drawn "reasonable" boxes around the same real printed value converge
+    to the IDENTICAL final box after exactly one refinement pass.
+
+    This refinement only ever runs after the FIRST pass already returned a
+    confident single target - an ambiguous or empty first pass is never
+    iterated, so refinement can never manufacture a confident answer out
+    of a genuinely ambiguous selection; it can only stabilize an already-
+    confident one. Symmetrically, if a later refinement pass were ever to
+    come back ambiguous or empty on an already-tight box (not observed in
+    testing, but never trusted blindly), the last confident box is kept
+    rather than discarding a working answer.
+
+    Exactly one confidently-selected candidate (after refinement) means
+    the selection contained one line of print - its final pixel extent
+    divided by the existing ppm is the measured height, and only that
+    number (never the rectangle's own height, never the dilated blob's
+    own height) is passed to the UNMODIFIED rule7_verdict(). No
+    candidates, or two candidates too close to call, both come back as
+    "not measurable" - this function never guesses which part of an
+    ambiguous selection is the intended numeral, and never averages
+    multiple candidates.
+
+    gap_ppm_fraction is accepted for signature stability but is no longer
+    used - the row-projection gap tolerance it used to configure was
+    replaced by the joining-dilation clustering above.
+
+    rotation_deg selects which orientation's rectified frame `region` is
+    expressed in - the same 0/90/180/270 convention
+    rule7_candidates_all_orientations() and rule7_overlay_for_orientation()
+    already use, so an inspector already looking at one of those oriented
+    overlays can draw directly on it.
+
+    region: (x, y, w, h) in that orientation's rectified-pixel coordinates
+    - exactly the coordinate space rule7_candidates_all_orientations()'s
+    rows already use.
+
+    Returns:
+        {
+          "measured_height_mm": float or None - None unless exactly one
+                                 confident candidate cluster was found,
+          "threshold_mm": float or None - None unless a height was
+                          measured AND pdp_area_cm2 was given,
+          "verdict": "PASS"/"FAIL"/"REVIEW" or None,
+          "problem": str or None - set whenever a verdict could not be
+                     produced, naming exactly why (no glyph found /
+                     N candidates found - ambiguous / PDP area not
+                     provided),
+          "band_count": int - how many candidate clusters were found on
+                        the inspector's OWN selection (before any
+                        refinement), for a caller that wants the raw
+                        diagnostic without parsing `problem`,
+          "overlay_png": PNG bytes. Always shows the raw selection (thin,
+                         unhighlighted, like any other non-target
+                         candidate); when exactly one confident candidate
+                         was found, its TRIMMED, REFINED ink extent is
+                         drawn as the highlighted target (labelled with
+                         the measured height and verdict) - the selection
+                         rectangle itself is never drawn as if it were the
+                         measurement. When zero or several
+                         similarly-positioned candidates were found, every
+                         candidate is drawn unhighlighted alongside the
+                         selection, so the evidence shows an inspector
+                         exactly why their selection was rejected.
+        }
+
+    Raises MarkerNotFound / MarkerTilted exactly as measure() does - this
+    calls measure() for the tilt gate and calibration, same as every other
+    Rule 7 path.
+    """
+    measure(image_path, marker_mm=marker_mm, chart_columns=False)   # enforces the tilt gate
+
+    bgr = cv2.imread(image_path)
+    pts = find_marker(bgr)
+    rect, ppm = rectify(bgr, pts, marker_mm=marker_mm)
+    code = _ROTATIONS[rotation_deg]
+    frame = rect if code is None else cv2.rotate(rect, code)
+
+    _, th = text_rows(frame, ppm, chart_columns=False)   # reuse the unmodified threshold; rows unused
+
+    x, y, w, h = (int(v) for v in region)
+    crop = th[y:y + h, x:x + w]
+
+    status, payload, num_clusters = _locate_target(crop, w, ppm)
+
+    measured_height_mm = threshold_mm = verdict = problem = None
+    selection_row = {"x": x, "y": y, "w": w, "h": h, "height_mm": h / ppm}
+    display_rows = [selection_row]
+    target_index = None
+
+    if status == "none":
+        problem = "No measurable glyph found inside the selected region."
+    elif status == "ambiguous":
+        ranked = payload
+        problem = (f"{len(ranked)} candidate values found inside the selected "
+                  "region, at similarly central positions - unclear which "
+                  "one is the intended numeral. Redraw the selection around "
+                  "only the complete MRP numeral.")
+        for cx, cy, cw, ch in ranked:
+            sub = crop[cy:cy + ch, cx:cx + cw]
+            ink_rows = np.where((sub > 0).any(axis=1))[0]
+            if ink_rows.size == 0:
+                continue
+            cy0 = cy + int(ink_rows.min())
+            cy1 = cy + int(ink_rows.max())
+            display_rows.append({"x": x + cx, "y": y + cy0, "w": cw,
+                                 "h": cy1 - cy0 + 1, "height_mm": (cy1 - cy0 + 1) / ppm})
+    else:
+        # status == "target": one confident cluster on the inspector's OWN
+        # selection. Refine it against its own bounding box - see the
+        # "ITERATIVE REFINEMENT" docstring section above for why zero
+        # margin and a 2-iteration cap.
+        cx, cy, cw, ch, cy0, cy1 = payload
+        tx, ty, tw, tgt_h = x + cx, y + cy0, cw, cy1 - cy0 + 1
+
+        for _ in range(2):
+            next_crop = th[ty:ty + tgt_h, tx:tx + tw]
+            next_status, next_payload, _ = _locate_target(next_crop, tw, ppm)
+            if next_status != "target":
+                break   # never discard an already-confident result
+            ncx, ncy, ncw, nch, ncy0, ncy1 = next_payload
+            ntx, nty, ntw, nth = tx + ncx, ty + ncy0, ncw, ncy1 - ncy0 + 1
+            if (ntx, nty, ntw, nth) == (tx, ty, tw, tgt_h):
+                break   # converged
+            tx, ty, tw, tgt_h = ntx, nty, ntw, nth
+
+        measured_height_mm = tgt_h / ppm
+        display_rows.append({"x": tx, "y": ty, "w": tw, "h": tgt_h,
+                             "height_mm": measured_height_mm})
+        target_index = 1
+        if pdp_area_cm2 is None:
+            problem = "PDP area not provided - cannot look up the Rule 7 threshold."
+        else:
+            threshold_mm, verdict = rule7_verdict(measured_height_mm, pdp_area_cm2, container)
+
+    overlay = annotate(frame, display_rows, target_index, verdict, threshold_mm)
+    ok, buf = cv2.imencode(".png", overlay)
+
+    return {
+        "measured_height_mm": measured_height_mm,
+        "threshold_mm": threshold_mm,
+        "verdict": verdict,
+        "problem": problem,
+        "band_count": num_clusters,
+        "overlay_png": buf.tobytes() if ok else None,
+    }
+
+
 def build_arg_parser():
     ap = argparse.ArgumentParser(
         description="PRAMAAN Rule 7 measurement: chart calibration, or a "
@@ -511,6 +1006,54 @@ def self_test():
         check("its measured height is close to the drawn 2.0 mm",
               abs(row_h_px / ppm - 2.0) < 0.15)
 
+    # --- Rule 7 manual-selection: _locate_target() clustering & refinement --
+    def refine(crop, box_w, ppm_, max_iters=2):
+        """
+        Mirrors rule7_measure_selected_region()'s own iterative-refinement
+        loop exactly, so its convergence behaviour can be unit-tested on a
+        synthetic binary image - no photo, marker, or file I/O needed.
+        """
+        status, payload, n = _locate_target(crop, box_w, ppm_)
+        if status != "target":
+            return status, None, n
+        cx, cy, cw, ch, cy0, cy1 = payload
+        tx, ty, tw, th_ = cx, cy0, cw, cy1 - cy0 + 1
+        for _ in range(max_iters):
+            nxt = crop[ty:ty + th_, tx:tx + tw]
+            nstatus, npayload, _ = _locate_target(nxt, tw, ppm_)
+            if nstatus != "target":
+                break
+            ncx, ncy, ncw, nch, ncy0, ncy1 = npayload
+            nt = (tx + ncx, ty + ncy0, ncw, ncy1 - ncy0 + 1)
+            if nt == (tx, ty, tw, th_):
+                break
+            tx, ty, tw, th_ = nt
+        return "target", th_ / ppm_, n
+
+    glyph = np.zeros((150, 300), np.uint8)
+    cv2.rectangle(glyph, (60, 50), (240, 100), 255, -1)   # one 50px (2.5mm) glyph
+
+    status_tight, h_tight, _ = refine(glyph[45:105, 55:245], 190, ppm)
+    status_wide, h_wide, _ = refine(glyph[20:130, 10:290], 280, ppm)
+    check("different reasonable boxes around one glyph converge to the same height",
+          status_tight == "target" and status_wide == "target" and
+          h_tight is not None and abs(h_tight - h_wide) < 1e-9)
+    check("converged height matches the drawn 2.5mm glyph",
+          status_tight == "target" and abs(h_tight - 2.5) < 0.15)
+
+    exact = glyph[50:100, 60:240]   # exactly the glyph's own drawn extent
+    status_exact, payload_exact, _ = _locate_target(exact, exact.shape[1], ppm)
+    check("zero margin: an exact-fit box's own ink extent is returned unchanged",
+          status_exact == "target" and payload_exact[4] == 0 and
+          payload_exact[5] == exact.shape[0] - 1)
+
+    two_glyphs = np.zeros((150, 400), np.uint8)
+    cv2.rectangle(two_glyphs, (40, 50), (140, 100), 255, -1)    # left glyph
+    cv2.rectangle(two_glyphs, (260, 50), (360, 100), 255, -1)   # right glyph, symmetric
+    status_amb, _, n_amb = _locate_target(two_glyphs, 400, ppm)
+    check("two similarly-central glyphs are reported ambiguous, not guessed",
+          status_amb == "ambiguous" and n_amb == 2)
+
     # --- marker tilt gate --------------------------------------------------
     def marker_canvas(stretch=1.0):
         d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
@@ -552,6 +1095,40 @@ def self_test():
     fake_rows = [{"x": 50, "y": 80, "w": 200, "h": 40, "height_mm": 2.0}]
     overlay = annotate(canvas, fake_rows, 0, "REVIEW", 2.5)
     check("annotate() returns an image of the same shape", overlay.shape == canvas.shape)
+
+    # --- Rule 7 manual-selection refinement on real photos ------------------
+    # Not "no photo needed" like the checks above - skipped gracefully (not
+    # counted as failed) when the file isn't present, so --self-test still
+    # runs clean on a fresh clone before any demo photo is captured. Present
+    # in this repository today, so they run for real here.
+    def region_height(image_path, marker_mm, region, tag):
+        if not os.path.exists(image_path):
+            print(f"  skip  {tag} ({image_path} not found - not required for self-test)")
+            return None
+        r = rule7_measure_selected_region(image_path, marker_mm, 0, region, pdp_area_cm2=None)
+        return r["measured_height_mm"]
+
+    cookie_h1 = region_height("archive/experiments/cookie.jpg", 28, (2360, 1490, 380, 94),
+                              "cookie.jpg former 4.70mm bug case")
+    if cookie_h1 is not None:
+        check("cookie.jpg: former 4.70mm bug case now measures ~2.8mm",
+              abs(cookie_h1 - 2.8) < 0.15)
+        cookie_h2 = region_height("archive/experiments/cookie.jpg", 28, (2385, 1508, 330, 62),
+                                  "cookie.jpg tighter box")
+        check("cookie.jpg: a tighter reasonable box converges to the same height",
+              cookie_h2 is not None and abs(cookie_h1 - cookie_h2) < 0.15)
+
+    walnutt_regions = [
+        (370, 2760, 330, 110),
+        (380, 2775, 300, 80),
+        (390, 2780, 280, 70),
+        (170, 2760, 730, 110),
+    ]
+    walnutt_heights = [region_height("demo/walnutt.jpg", 28, r, "walnutt.jpg region")
+                       for r in walnutt_regions]
+    if all(hh is not None for hh in walnutt_heights):
+        check("walnutt.jpg: four differently-sized reasonable boxes all measure ~2.35mm",
+              all(abs(hh - 2.35) < 0.05 for hh in walnutt_heights))
 
     print(f"\n{ok}/{total} checks passed")
     return ok == total

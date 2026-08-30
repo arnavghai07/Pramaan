@@ -286,6 +286,89 @@ Ultralytics YOLO is AGPL-3.0 and is explicitly excluded.
       synthetic FAIL pipeline evidence for Phase C` (this update — not yet
       committed)
 
+### Phase C+ — Unified Rule 6 + Rule 7 inspection workflow (completed 29–30 Aug, outside the original phase sequence)
+
+> Do not confuse this with Phase D immediately below, which is a
+> different, still-unstarted body of work (PDF export, inspection
+> history, seeded corpus). This subsection records engineering work done
+> after Phase C closed and before Phase D began, so the two "Phase D"s
+> don't collide: nothing here marks any Phase D or Phase E checkbox as
+> done.
+
+- [x] `POST /inspect` combines Rule 6 declaration extraction
+      (`vlm_extract.py`, unmodified) and Rule 7 physical measurement
+      (`measure_chart.py`, unmodified) into one deterministic verdict via
+      `engine/verdict.py`'s `combine_status()` — COMPLIANT / NON_COMPLIANT
+      / NEEDS_MANUAL_REVIEW. The verdict is never computed in the
+      frontend.
+- [x] Rule 7 evidence overlay and its measured height / threshold /
+      margin are rendered as text in the results screen — a judge does
+      not need to zoom into the image to find the number.
+- [x] Automatic Rule 7 candidate detection remains the primary path
+      (`rule7_result()`, `POST /measure/candidates`).
+- [x] Human-selected precision-region fallback (`rule7_measure_selected_
+      region()`, `POST /measure/region`) for when automatic candidate
+      discovery cannot cleanly isolate the complete numeral. The
+      rectangle an inspector draws is never trusted as the measurement:
+      the backend crops the same raw binary threshold `text_rows()`
+      already computes, finds the actual ink extent inside the selection,
+      and requires exactly one ink band before measuring anything. Zero
+      bands ("no glyph found") or more than one ("ambiguous, spans
+      multiple lines") both return `NEEDS_MANUAL_REVIEW` rather than
+      guessing.
+- [x] `find_marker()`, `rectify()`, `text_rows()`, `measure()`,
+      `rule7_lookup()`, `rule7_verdict()` and `annotate()` are unmodified
+      by any of the above — every new code path calls them; none of them
+      were edited.
+
+**Verified evidence (real photographs, not reinterpreted):**
+
+1. `pt.jpg` — real physical product, real physical calibration marker,
+   automatic Rule 7 path. Tilt 1.6%. MRP numeral measured **2.35 mm**
+   against a **1.5 mm** Table-I threshold (77 cm² PDP, normal print) —
+   **PASS**.
+2. `wal.jpg` + `walnutt.jpg` — same physical product (confirmed by
+   re-running extraction: identical MRP 400.00, unit price 1.60, mfg
+   JUL.2026, use-by JAN.2027, FSSAI 10012011000555, net weight 250g).
+   `wal.jpg` supplies the Rule 6 package image — 6/6 mandatory
+   declarations, no cross-check problems. `walnutt.jpg` supplies the
+   Rule 7 calibration close-up: automatic candidate discovery could not
+   cleanly isolate "400.00" (it fragments the numeral into separate
+   digits, or merges it with the adjacent unit-price/batch text,
+   depending on orientation), so the manual-region fallback measured
+   **2.45 mm** against a **2.5 mm** threshold (185.6 cm² PDP, normal
+   print) — **REVIEW**. Combined result: **NEEDS_MANUAL_REVIEW**.
+3. Synthetic undersized fixture (generated marker, deliberately
+   undersized numeral): **0.60–0.70 mm** measured against a **1.0 mm**
+   threshold — **FAIL**. Confirms `rule7_verdict()`'s FAIL path is
+   mechanically correct. Engineering evidence only —
+   **explicitly NOT physical-pack evidence, and must never be presented
+   as a real non-compliant product.**
+
+- [ ] **Still open:** a real, physically non-compliant pack producing a
+      genuine Rule 7 FAIL has never been captured — this is the same open
+      gate named earlier in Phase C. `wal.jpg`/`walnutt.jpg`'s REVIEW
+      result is a real borderline case, not a FAIL, and does not close
+      this gate.
+
+**Remaining practical demo risks:**
+
+- Rule 6 VLM latency on CPU-only inference is highly variable — one full
+  scan measured 217 seconds in this environment this session; a
+  text-only health check (no image) took about 26 seconds including a
+  cold model reload. A warm-up scan before going on stage is
+  recommended.
+- Incomplete image coverage can still be indistinguishable from a
+  genuine missing declaration — a Rule 6 field absent because the photo
+  didn't show that panel renders identically to a real omission (both →
+  `NON_COMPLIANT`). Not fixed; noted as a known gap.
+- Known corpus bugs remain unfixed: `seed.jpg`'s unparseable use-by date,
+  `creatin.jpg`'s undetected derivable net quantity, and
+  `iron.jpg`/`perfume.jpg`/`sun.jpg`'s mislabeled licence numbers. Do not
+  use these as showcase examples — `oil.jpg`, `wal.jpg`, `pen.jpg`,
+  `oats.jpg` and `chilli.jpg` are confirmed safe to demo.
+- No real physical Rule 7 FAIL evidence exists yet (see above).
+
 ### Phase D — Report and repository (3 Sep)
 
 - [ ] PDF compliance report (ReportLab): fields, verdict, rule citations,
