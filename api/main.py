@@ -33,7 +33,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
@@ -43,10 +43,14 @@ from engine.measure_chart import (MarkerNotFound, MarkerTilted, measure, rule7_r
 from engine.verdict import combine_status
 
 from api.models import (CandidatesResponse, DashboardResponse, DeleteResponse,
-                        InspectionDetail, InspectionListResponse, InspectionResponse,
-                        InspectionSummary, MeasureResponse, Rule7Result, ScanResponse)
+                        ErrorResponse, InspectionDetail, InspectionListResponse,
+                        InspectionResponse, InspectionSummary, MeasureResponse,
+                        Rule7Result, ScanResponse)
 from api.auth import current_user, require_admin
 from api.auth import router as auth_router
+
+from reports import (build_report_data, render_docx, render_pdf,
+                     report_filename)
 
 from storage import repository
 from storage import users as users_repo
@@ -79,6 +83,11 @@ app.add_middleware(
     allow_origins=["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
+    # Content-Disposition carries the report filename. A cross-origin fetch
+    # cannot read a response header unless it is exposed here, so without
+    # this the console would have to invent its own filename and the two
+    # could drift apart.
+    expose_headers=["Content-Disposition"],
 )
 
 app.include_router(auth_router)
@@ -518,6 +527,75 @@ def get_evidence(inspection_id: int, kind: str,
     media_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
     return FileResponse(path, media_type=media_type,
                         filename=f"inspection-{inspection_id}-{kind}{path.suffix}")
+
+
+# ---------------------------------------------------------------------------
+# Compliance report export
+#
+# Two renderings of ONE stored record. Neither route runs the VLM, measures
+# an image, or touches engine/verdict.py: they load the row, hand it to
+# reports/builder.py, and stream the document back. A report is a
+# representation of a decision already made, never a new one.
+# ---------------------------------------------------------------------------
+#: Format -> (renderer, MIME type). Adding a third export means adding a
+#: renderer and one line here, not a third near-identical route handler.
+_REPORT_FORMATS = {
+    "pdf": (render_pdf, "application/pdf"),
+    "docx": (render_docx, "application/vnd.openxmlformats-officedocument."
+                          "wordprocessingml.document"),
+}
+
+
+def _report_response(inspection_id: int, fmt: str, db: Session) -> Response:
+    """Shared body of both report routes: load, render, attach, return."""
+    row = repository.get_inspection(db, inspection_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"no stored inspection with id {inspection_id}")
+
+    renderer, media_type = _REPORT_FORMATS[fmt]
+    document = renderer(build_report_data(row))
+    filename = report_filename(inspection_id, fmt)
+
+    # Returned as a body rather than a temp FileResponse: both documents are
+    # built in memory and are a few hundred KB, so writing one to disk only
+    # to stream and delete it would add a failure mode for nothing.
+    return Response(
+        content=document,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/inspections/{inspection_id}/report/pdf",
+         response_class=Response,
+         responses={200: {"content": {"application/pdf": {}}},
+                    404: {"model": ErrorResponse}})
+def inspection_report_pdf(inspection_id: int, db: Session = Depends(get_db),
+                          user: User = Depends(current_user)):
+    """
+    The stored inspection as a printable PDF compliance report.
+
+    Any signed-in officer may download a report — a report reveals nothing
+    the inspection detail page does not already show them, and refusing one
+    to the officer who has to file it would be theatre. Deleting a record
+    stays ADMIN-only; reading one does not.
+    """
+    return _report_response(inspection_id, "pdf", db)
+
+
+@app.get("/inspections/{inspection_id}/report/docx",
+         response_class=Response,
+         responses={200: {"content": {"application/vnd.openxmlformats-"
+                                      "officedocument.wordprocessingml.document": {}}},
+                    404: {"model": ErrorResponse}})
+def inspection_report_docx(inspection_id: int, db: Session = Depends(get_db),
+                           user: User = Depends(current_user)):
+    """
+    The same report as an editable Word document, for an officer who has to
+    add context or file it into a departmental workflow.
+    """
+    return _report_response(inspection_id, "docx", db)
 
 
 @app.delete("/inspections/{inspection_id}", response_model=DeleteResponse)

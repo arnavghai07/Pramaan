@@ -534,6 +534,62 @@ export async function fetchEvidenceObjectUrl(
   return URL.createObjectURL(await res.blob());
 }
 
+export type ReportFormat = "pdf" | "docx";
+
+/**
+ * Download one stored inspection's compliance report.
+ *
+ * Same problem as an evidence image, same solution: the endpoint needs an
+ * Authorization header, and a plain <a href> cannot send one. Putting the
+ * token in the query string would write a live credential into browser
+ * history and every proxy log in between, so the document is fetched, the
+ * blob is handed to a temporary anchor, and the object URL is revoked
+ * immediately afterwards.
+ *
+ * The filename comes from the server's Content-Disposition header when it
+ * is readable (api/main.py exposes it through CORS) so the browser and the
+ * API cannot disagree about what the file is called; the local fallback
+ * matches the server's naming rule.
+ */
+export async function downloadInspectionReport(
+  id: number,
+  format: ReportFormat
+): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/inspections/${id}/report/${format}`, {
+      headers: authHeaders(),
+    });
+  } catch {
+    throw unreachable();
+  }
+  if (!res.ok) throw await readApiError(res);
+
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download =
+      filenameFromDisposition(res.headers.get("Content-Disposition")) ??
+      `PRAMAAN_Inspection_${id}.${format}`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    // Revoking too early cancels the download in some browsers, so this
+    // runs a tick after the click rather than synchronously with it.
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  }
+}
+
+/** `attachment; filename="PRAMAAN_Inspection_12.pdf"` -> the filename. */
+function filenameFromDisposition(header: string | null): string | null {
+  if (!header) return null;
+  const match = /filename="?([^";]+)"?/i.exec(header);
+  return match ? match[1] : null;
+}
+
 // ---------------------------------------------------------------------------
 // Enforcement dashboard
 // ---------------------------------------------------------------------------

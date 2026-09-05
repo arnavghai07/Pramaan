@@ -13,9 +13,11 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   deleteInspection,
+  downloadInspectionReport,
   getInspection,
   ScanError,
   type InspectionDetail,
+  type ReportFormat,
 } from "@/lib/api";
 
 const RULE7_STYLE: Record<"PASS" | "FAIL" | "REVIEW", { label: string; className: string }> = {
@@ -52,6 +54,8 @@ function Detail() {
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [downloading, setDownloading] = useState<ReportFormat | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!Number.isInteger(id) || id <= 0) {
@@ -84,6 +88,32 @@ function Detail() {
       cancelled = true;
     };
   }, [id]);
+
+  /**
+   * A failed download is reported next to the buttons rather than through
+   * the page-level error state: the inspection itself loaded fine, and
+   * replacing the whole record with an error message because a report could
+   * not be built would hide the evidence the officer came here to read.
+   */
+  const handleDownload = useCallback(
+    async (format: ReportFormat) => {
+      setReportError(null);
+      setDownloading(format);
+      try {
+        await downloadInspectionReport(id, format);
+      } catch (err) {
+        console.error("PRAMAAN report download failed:", err);
+        setReportError(
+          err instanceof ScanError
+            ? err.friendlyMessage
+            : `The ${format.toUpperCase()} report could not be generated.`
+        );
+      } finally {
+        setDownloading(null);
+      }
+    },
+    [id]
+  );
 
   const handleDelete = useCallback(async () => {
     setDeleting(true);
@@ -149,6 +179,37 @@ function Detail() {
       </header>
 
       <StatusBanner status={record.overall_status} findings={record.findings} />
+
+      <section className="flex flex-col gap-2">
+        <div className="flex flex-wrap gap-2">
+          <Button
+            variant="outline"
+            disabled={downloading !== null}
+            onClick={() => handleDownload("pdf")}
+          >
+            {downloading === "pdf" ? "Preparing PDF…" : "Download PDF report"}
+          </Button>
+          <Button
+            variant="outline"
+            disabled={downloading !== null}
+            onClick={() => handleDownload("docx")}
+          >
+            {downloading === "docx"
+              ? "Preparing DOCX…"
+              : "Download DOCX report"}
+          </Button>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Both formats reproduce this stored record exactly — nothing is
+          re-scanned, re-measured or re-decided to produce them. The DOCX is
+          editable for filing.
+        </p>
+        {reportError && (
+          <p className="text-sm text-amber-700" role="alert">
+            {reportError}
+          </p>
+        )}
+      </section>
 
       <Card>
         <CardHeader>
