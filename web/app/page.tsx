@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useState } from "react";
+import Link from "next/link";
+import { RequireAuth } from "@/components/auth-provider";
 import { CapturePanel } from "@/components/capture-panel";
 import { ResultsPanel } from "@/components/results-panel";
 import { ResultsSkeleton } from "@/components/results-skeleton";
@@ -115,6 +117,16 @@ function Rule7Readout({ rule7 }: { rule7: InspectionResponse["rule7"] }) {
 }
 
 export default function Home() {
+  // The guard is a convenience for the user, not the security boundary —
+  // /scan and /inspect are protected in FastAPI regardless (api/auth.py).
+  return (
+    <RequireAuth>
+      <ScannerPage />
+    </RequireAuth>
+  );
+}
+
+function ScannerPage() {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
 
   const handleImageReady = useCallback(async (image: Blob, filename: string) => {
@@ -158,7 +170,7 @@ export default function Home() {
   return (
     <div className="min-h-screen px-4 py-10 sm:px-8">
       <header className="mb-8 text-center">
-        <h1 className="text-2xl font-bold">PRAMAAN</h1>
+        <h1 className="text-2xl font-bold">New inspection</h1>
         <p className="text-muted-foreground text-sm">
           Legal Metrology compliance scanner
         </p>
@@ -219,6 +231,7 @@ export default function Home() {
                 ? String(status.inspection.rule6.fields.mrp_value)
                 : null
             }
+            inspectionId={status.inspection.inspection_id}
             onComplete={completeRule7}
             onCancel={cancelRule7}
           />
@@ -249,6 +262,26 @@ export default function Home() {
                     Add Rule 7 measurement (calibrated)
                   </Button>
                 </div>
+              )}
+              {status.inspection.inspection_id != null ? (
+                <Button
+                  variant="outline"
+                  className="w-full"
+                  nativeButton={false}
+                  render={
+                    <Link href={`/inspections/${status.inspection.inspection_id}`} />
+                  }
+                >
+                  View saved record #{status.inspection.inspection_id}
+                </Button>
+              ) : (
+                // inspection_id is null only when the server could not write
+                // the record. The verdict above is unaffected and still
+                // stands; saying so beats a link that would 404.
+                <p className="text-xs text-amber-700">
+                  This inspection was completed but could not be saved to
+                  history. The verdict above is unaffected.
+                </p>
               )}
               <Button variant="outline" onClick={reset} className="w-full">
                 Scan another pack

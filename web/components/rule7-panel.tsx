@@ -36,6 +36,17 @@ interface Rule7PanelProps {
    * leaves this component's behavior exactly as it was.
    */
   rule6MrpValue?: string | null;
+  /**
+   * The history record the initial Rule 6 scan was saved as. Sent back to
+   * POST /inspect so this measurement UPDATES that record instead of
+   * writing a second row holding only a Rule 7 photo — one physical pack
+   * stays one inspection, with one set of evidence images.
+   *
+   * Null when the initial scan could not be persisted. The measurement
+   * still runs and still returns a verdict; the server simply creates a
+   * fresh record for it rather than updating one that does not exist.
+   */
+  inspectionId?: number | null;
   onComplete: (inspection: InspectionResponse) => void;
   onCancel: () => void;
 }
@@ -78,6 +89,7 @@ interface DragRect {
 export function Rule7Panel({
   rule6Result,
   rule6MrpValue,
+  inspectionId,
   onComplete,
   onCancel,
 }: Rule7PanelProps) {
@@ -250,6 +262,7 @@ export function Rule7Panel({
     try {
       const inspection = await inspectPack({
         rule6Result,
+        inspectionId,
         rule7Image: phase.image,
         rule7Filename: phase.filename,
         markerMm,
@@ -280,6 +293,7 @@ export function Rule7Panel({
     container,
     markerMm,
     rule6Result,
+    inspectionId,
     onComplete,
   ]);
 

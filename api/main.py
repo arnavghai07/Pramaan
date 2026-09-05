@@ -13,30 +13,62 @@ measure_chart.py). The exception handlers below are the "error middleware":
 every failure mode the engine defines is mapped to a JSON body with a
 readable message, never a raw 500 traceback.
 
+Completed inspections are persisted to SQLite through storage/ — see
+POST /inspect and the GET/DELETE /inspections routes at the bottom of this
+file. Persistence is strictly downstream of the verdict: nothing in
+storage/ can change what engine/verdict.py decided.
+
 Run with:
     uvicorn api.main:app --reload --port 8000
 """
 import base64
 import json
 import os
+import sys
 import tempfile
+from contextlib import asynccontextmanager
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
 from engine.vlm_extract import BackendError, ExtractionFailed, extract
 from engine.measure_chart import (MarkerNotFound, MarkerTilted, measure, rule7_result,
                                   rule7_measure_selected_region)
 from engine.verdict import combine_status
 
-from api.models import (CandidatesResponse, InspectionResponse, MeasureResponse,
-                        Rule7Result, ScanResponse)
+from api.models import (CandidatesResponse, DeleteResponse, InspectionDetail,
+                        InspectionListResponse, InspectionResponse, InspectionSummary,
+                        MeasureResponse, Rule7Result, ScanResponse)
+from api.auth import current_user, require_admin
+from api.auth import router as auth_router
 
-app = FastAPI(title="PRAMAAN", version="0.1.0")
+from storage import repository
+from storage import users as users_repo
+from storage.database import get_db, init_db, session_scope
+from storage.models import User
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Create data/, data/evidence/ and any missing tables before the first
+    request, then seed the demo accounts if no user exists yet. A fresh
+    clone needs no migration step and no user-creation step: start uvicorn
+    and you can sign in.
+    """
+    init_db()
+    with session_scope() as db:
+        users_repo.seed_demo_users(db)
+    yield
+
+
+app = FastAPI(title="PRAMAAN", version="0.3.0", lifespan=lifespan)
 
 # The Next.js dev server (web/) calls this API from a different origin, and a
 # browser fetch is blocked client-side without this even though the server
@@ -48,6 +80,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
 
 DEFAULT_MODEL = os.environ.get("VLM_MODEL", "qwen2.5vl:7b")
 
@@ -92,7 +126,8 @@ async def _save_upload(image: UploadFile) -> str:
 @app.post("/scan", response_model=ScanResponse)
 async def scan(image: UploadFile = File(...),
                backend: str = Form("ollama"),
-               model: Optional[str] = Form(None)):
+               model: Optional[str] = Form(None),
+               user: User = Depends(current_user)):
     tmp_path = await _save_upload(image)
     try:
         return extract(tmp_path, backend=backend, model=model or DEFAULT_MODEL)
@@ -102,7 +137,8 @@ async def scan(image: UploadFile = File(...),
 
 @app.post("/measure", response_model=MeasureResponse)
 async def measure_endpoint(image: UploadFile = File(...),
-                            marker_mm: float = Form(40.0)):
+                            marker_mm: float = Form(40.0),
+                            user: User = Depends(current_user)):
     tmp_path = await _save_upload(image)
     try:
         return measure(tmp_path, marker_mm=marker_mm)
@@ -112,7 +148,8 @@ async def measure_endpoint(image: UploadFile = File(...),
 
 @app.post("/measure/candidates", response_model=CandidatesResponse)
 async def measure_candidates(image: UploadFile = File(...),
-                              marker_mm: float = Form(40.0)):
+                              marker_mm: float = Form(40.0),
+                              user: User = Depends(current_user)):
     """
     Every Rule 7 candidate row on a photo, with no target chosen — the
     picking step of the inspector workflow. The UI shows the returned
@@ -143,7 +180,8 @@ async def measure_region(image: UploadFile = File(...),
                           region_w: int = Form(...),
                           region_h: int = Form(...),
                           pdp_area_cm2: Optional[float] = Form(None),
-                          container: str = Form("normal")):
+                          container: str = Form("normal"),
+                          user: User = Depends(current_user)):
     """
     FALLBACK Rule 7 measurement for when automatic candidate discovery
     could not isolate a clean, complete numeral: the inspector draws a
@@ -192,7 +230,10 @@ async def inspect(rule6_image: Optional[UploadFile] = File(None),
                    region_x: Optional[int] = Form(None),
                    region_y: Optional[int] = Form(None),
                    region_w: Optional[int] = Form(None),
-                   region_h: Optional[int] = Form(None)):
+                   region_h: Optional[int] = Form(None),
+                   product_name: Optional[str] = Form(None),
+                   inspection_id: Optional[int] = Form(None),
+                   user: User = Depends(current_user)):
     """
     The unified workflow: Rule 6 declarations + (optional) Rule 7
     measurement, combined into one COMPLIANT / NON_COMPLIANT /
@@ -231,7 +272,30 @@ async def inspect(rule6_image: Optional[UploadFile] = File(None),
         "automatic discovery didn't work" signal.
     Neither is ever returned in the response — Rule7Result carries the
     resolved measurement instead.
+
+    PERSISTENCE. Every completed inspection is written to SQLite and its id
+    returned as "inspection_id". Two optional inputs govern that:
+      - product_name: a label for the history list. Never inferred — the
+        VLM has no product-name field and the pack may not print one.
+      - inspection_id: UPDATE the inspection this names instead of creating
+        a new one. This is how the Rule 7 follow-up call (which sends
+        rule6_result plus a rule7_image, for a pack already scanned once)
+        adds its measurement to the existing record rather than leaving two
+        half-inspections of one pack in the history. Validated BEFORE any
+        extraction or measurement runs, so an unknown id costs nothing and
+        can never discard a verdict that has already been computed.
+
+    Storage failure never fails the request: the inspection is returned with
+    inspection_id null and the reason logged server-side. A verdict that
+    cost a minute of inference is not thrown away because a disk was full.
     """
+    if inspection_id is not None:
+        with session_scope() as db:
+            if repository.get_inspection(db, inspection_id) is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"no stored inspection with id {inspection_id}")
+
     rule6_path = await _save_upload(rule6_image) if rule6_image else None
     rule7_path = await _save_upload(rule7_image) if rule7_image else None
     try:
@@ -288,10 +352,186 @@ async def inspect(rule6_image: Optional[UploadFile] = File(None),
                 rule7 = {"attempted": True, "problem": str(e)}
 
         overall_status, findings = combine_status(rule6, rule7)
+
+        # Persist AFTER the verdict exists and BEFORE the finally block
+        # deletes the uploads — repository.save_inspection() copies those
+        # temp files into permanent evidence storage. A file copy and one
+        # INSERT, on a local SQLite file: milliseconds against a VLM
+        # inference measured in minutes, so this adds nothing a user sees.
+        saved_id = None
+        try:
+            with session_scope() as db:
+                existing = (repository.get_inspection(db, inspection_id)
+                            if inspection_id is not None else None)
+                row = repository.save_inspection(
+                    db, rule6=rule6, rule7=rule7, overall_status=overall_status,
+                    findings=findings, product_name=product_name,
+                    rule6_src_path=rule6_path, rule7_src_path=rule7_path,
+                    existing=existing, inspector=user)
+                saved_id = row.id
+        except Exception as e:                      # noqa: BLE001 — see docstring
+            print(f"[storage] inspection could not be saved: {e!r}", file=sys.stderr)
+
         return {"rule6": rule6, "rule7": rule7,
-                "overall_status": overall_status, "findings": findings}
+                "overall_status": overall_status, "findings": findings,
+                "inspection_id": saved_id}
     finally:
         if rule6_path:
             os.remove(rule6_path)
         if rule7_path:
             os.remove(rule7_path)
+
+
+# ---------------------------------------------------------------------------
+# Inspection history
+#
+# Read-only replay of what POST /inspect already decided. None of these
+# routes recomputes a verdict, re-runs the model, or re-measures anything:
+# they return the stored decision as it was made. A stored REVIEW stays a
+# REVIEW forever.
+# ---------------------------------------------------------------------------
+
+def _summary(row) -> dict:
+    """Shared projection for both the list and detail responses."""
+    return {
+        "id": row.id,
+        "created_at": row.created_at,
+        "product_name": row.product_name,
+        "overall_status": row.overall_status,
+        "mandatory_present": row.mandatory_present,
+        "mandatory_total": row.mandatory_total,
+        "rule7_verdict": row.rule7_verdict,
+        "manufacturer": row.manufacturer,
+        "mrp": row.mrp,
+        "net_quantity": row.net_quantity,
+        "mfg_date": row.mfg_date,
+        "has_rule7": row.rule7_result_json is not None,
+        "inspector_name": row.inspector_name,
+    }
+
+
+def _day_bounds(date_from: Optional[date],
+                date_to: Optional[date]) -> tuple[Optional[datetime], Optional[datetime]]:
+    """
+    Turn two calendar days into the half-open UTC range the repository
+    compares against. date_to is inclusive as a DAY — a filter "to 5 Sep"
+    must include an inspection recorded at 17:40 on 5 September, so the
+    bound sent down is midnight at the START of 6 September.
+    """
+    start = datetime.combine(date_from, time.min) if date_from else None
+    end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
+    return start, end
+
+
+@app.get("/inspections", response_model=InspectionListResponse)
+def list_inspections(limit: int = Query(20, ge=1, le=100),
+                     offset: int = Query(0, ge=0),
+                     status: Optional[str] = Query(None,
+                         description="COMPLIANT | NON_COMPLIANT | NEEDS_MANUAL_REVIEW"),
+                     q: Optional[str] = Query(None,
+                         description="substring of product name or manufacturer"),
+                     date_from: Optional[date] = Query(None,
+                         description="inclusive, YYYY-MM-DD, UTC"),
+                     date_to: Optional[date] = Query(None,
+                         description="inclusive, YYYY-MM-DD, UTC"),
+                     db: Session = Depends(get_db),
+                     user: User = Depends(current_user)):
+    """
+    Recent inspections, newest first. Summary columns only — no Rule 6
+    field list and no base64 overlay, so this stays fast as history grows.
+    `total` is the count matching the filters, ignoring limit/offset.
+    """
+    start, end = _day_bounds(date_from, date_to)
+    rows, total = repository.list_inspections(
+        db, limit=limit, offset=offset, status=status, q=q,
+        date_from=start, date_to=end)
+    return {"items": [InspectionSummary(**_summary(r)) for r in rows],
+            "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/inspections/{inspection_id}", response_model=InspectionDetail)
+def get_inspection(inspection_id: int,
+                   include_overlay: bool = Query(False,
+                       description="inline the Rule 7 overlay as base64 (~9 MB); "
+                                   "prefer the evidence endpoint"),
+                   db: Session = Depends(get_db),
+                   user: User = Depends(current_user)):
+    """
+    One complete stored inspection, in the same shapes POST /inspect
+    returns, so the same client code can render a replayed inspection and a
+    live one.
+
+    The Rule 7 overlay is NOT inlined by default — see
+    repository.rule7_for_response(). `evidence` lists which images exist;
+    fetch each from GET /inspections/{id}/evidence/{kind}.
+    """
+    row = repository.get_inspection(db, inspection_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"no stored inspection with id {inspection_id}")
+
+    available = repository.available_evidence(row)
+    return {**_summary(row),
+            "rule6": row.rule6_result_json,
+            "rule7": repository.rule7_for_response(row, include_overlay=include_overlay),
+            "findings": row.findings_json or [],
+            "evidence": available,
+            "rule6_image_stored": "rule6" in available,
+            "rule7_image_stored": "rule7" in available,
+            "rule7_overlay_stored": "overlay" in available}
+
+
+@app.get("/inspections/{inspection_id}/evidence/{kind}")
+def get_evidence(inspection_id: int, kind: str,
+                 db: Session = Depends(get_db),
+                 user: User = Depends(current_user)):
+    """
+    Stream one stored evidence image: kind is "rule6", "rule7" or "overlay".
+
+    Two distinct 404s on purpose. An unknown inspection is one thing; an
+    inspection that exists but never had that image (Rule 6 answered from a
+    cached result, no Rule 7 photo taken, a marker photo that failed before
+    an overlay could be drawn) is another, and an inspector chasing missing
+    evidence needs to be told which. Neither is an error state of the
+    system — "no Rule 7 photo" is a normal, complete inspection.
+
+    `kind` is resolved through repository.EVIDENCE_KINDS, never interpolated
+    into a filesystem path, so no request can address a file the inspection
+    record does not name.
+    """
+    row = repository.get_inspection(db, inspection_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"no stored inspection with id {inspection_id}")
+    if kind not in repository.EVIDENCE_KINDS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown evidence kind {kind!r}; expected one of "
+                   f"{', '.join(repository.EVIDENCE_KINDS)}")
+
+    path = repository.evidence_path(row, kind)
+    if path is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"inspection {inspection_id} has no stored {kind} image")
+
+    media_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    return FileResponse(path, media_type=media_type,
+                        filename=f"inspection-{inspection_id}-{kind}{path.suffix}")
+
+
+@app.delete("/inspections/{inspection_id}", response_model=DeleteResponse)
+def delete_inspection(inspection_id: int, db: Session = Depends(get_db),
+                      admin: User = Depends(require_admin)):
+    """
+    Remove one inspection and its stored evidence images.
+
+    ADMIN only. Deleting an inspection destroys the evidence behind an
+    enforcement decision, which is not something a field officer should be
+    able to do to their own record on a whim.
+    """
+    if not repository.delete_inspection(db, inspection_id):
+        raise HTTPException(status_code=404,
+                            detail=f"no stored inspection with id {inspection_id}")
+    db.commit()
+    return {"id": inspection_id, "deleted": True}

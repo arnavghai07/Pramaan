@@ -6,9 +6,10 @@ dicts that engine.vlm_extract.extract() and engine.measure_chart.measure()
 already return; FastAPI validates the return value against response_model and
 serialises it, so the shape here must match those functions exactly.
 """
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_serializer
 
 
 class FieldRow(BaseModel):
@@ -99,3 +100,110 @@ class InspectionResponse(BaseModel):
     rule7: Optional[Rule7Result] = None
     overall_status: str   # COMPLIANT | NON_COMPLIANT | NEEDS_MANUAL_REVIEW
     findings: list[str] = []
+    # Set once the inspection has been persisted (storage/repository.py).
+    # Optional, and null when persistence failed, so an existing client that
+    # ignores this field behaves exactly as it did before history existed —
+    # and so a storage fault can never destroy a verdict that has already
+    # cost a minute of VLM inference.
+    inspection_id: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# Inspection history (SQLite via storage/)
+# ---------------------------------------------------------------------------
+class InspectionSummary(BaseModel):
+    """
+    One row of GET /inspections. Carries only the denormalised columns — a
+    list view never drags a full Rule 6 result or a base64 overlay off disk
+    to render a line of history.
+    """
+    id: int
+    created_at: datetime
+    product_name: Optional[str] = None
+    overall_status: str
+    mandatory_present: int
+    mandatory_total: int
+    rule7_verdict: Optional[str] = None
+    manufacturer: Optional[str] = None
+    mrp: Optional[float] = None
+    net_quantity: Optional[str] = None
+    mfg_date: Optional[str] = None
+    has_rule7: bool = False
+    inspector_name: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+    @field_serializer("created_at")
+    def _utc(self, value: datetime) -> str:
+        """
+        SQLite stores naive datetimes; storage/models.py writes UTC by
+        convention. Marking it explicitly on the way out stops a browser
+        from reading a UTC timestamp as local time.
+        """
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class InspectionDetail(InspectionSummary):
+    """
+    GET /inspections/{id} — the full stored result, in the same shapes a
+    live POST /inspect returns, so a replayed inspection can be rendered by
+    exactly the same client code. The Rule 7 evidence overlay is read back
+    from disk and re-attached as base64 here.
+    """
+    rule6: ScanResponse
+    rule7: Optional[Rule7Result] = None
+    findings: list[str] = []
+    # Which evidence files exist for this inspection. The images themselves
+    # are served by GET /inspections/{id}/evidence/{kind} rather than inlined
+    # here: the Rule 7 overlay alone runs to ~9 MB of base64, which would
+    # make opening a history record slower than running the original scan.
+    evidence: list[str] = []
+    rule6_image_stored: bool = False
+    rule7_image_stored: bool = False
+    rule7_overlay_stored: bool = False
+
+
+class InspectionListResponse(BaseModel):
+    items: list[InspectionSummary]
+    total: int      # matching rows, ignoring limit/offset
+    limit: int
+    offset: int
+
+
+class DeleteResponse(BaseModel):
+    id: int
+    deleted: bool
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    # 72 bytes is bcrypt's hard limit; anything longer is silently truncated
+    # by the algorithm, so it is refused here rather than half-checked later.
+    password: str = Field(min_length=1, max_length=72)
+
+
+class UserOut(BaseModel):
+    """
+    A user as the client may see them. Deliberately has no password_hash
+    field: a response model FastAPI filters through cannot leak a column
+    that was never declared on it, even if a handler returns the whole ORM
+    row by accident.
+    """
+    id: int
+    username: str
+    role: Literal["ADMIN", "INSPECTOR"]
+    full_name: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int          # seconds
+    user: UserOut

@@ -1,7 +1,13 @@
 /**
  * Typed client for the PRAMAAN FastAPI service. Mirrors api/models.py exactly
  * — if that file's shapes change, these types must change with them.
+ *
+ * Every call below sends the bearer token from lib/auth.ts. A 401 comes back
+ * as AuthError rather than a generic failure, so the UI can send the officer
+ * to the sign-in page instead of showing "analysis failed" for what is really
+ * an expired session.
  */
+import { authHeaders, clearToken, type User } from "@/lib/auth";
 
 export type FieldState = "PRESENT" | "MISSING" | "REVIEW";
 
@@ -51,7 +57,28 @@ export class ScanError extends Error {
   }
 }
 
+/**
+ * The session is gone (never signed in, expired, or the account was
+ * deactivated). Thrown instead of ScanError so callers can redirect rather
+ * than render a scan-failure message.
+ */
+export class AuthError extends ScanError {
+  constructor(detail: string) {
+    super(detail, undefined, "Your session has ended. Please sign in again.");
+    this.name = "AuthError";
+  }
+}
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+/** Network-level failure shared by every call. */
+function unreachable(): ScanError {
+  return new ScanError(
+    `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`,
+    undefined,
+    SERVICE_UNAVAILABLE_MESSAGE
+  );
+}
 
 export async function scanImage(
   image: File | Blob,
@@ -62,24 +89,16 @@ export async function scanImage(
 
   let res: Response;
   try {
-    res = await fetch(`${API_URL}/scan`, { method: "POST", body: form });
+    res = await fetch(`${API_URL}/scan`, {
+      method: "POST",
+      body: form,
+      headers: authHeaders(),
+    });
   } catch {
-    throw new ScanError(
-      `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`,
-      undefined,
-      SERVICE_UNAVAILABLE_MESSAGE
-    );
+    throw unreachable();
   }
 
-  if (!res.ok) {
-    let body: ApiErrorBody = { detail: `Scan failed (HTTP ${res.status})` };
-    try {
-      body = await res.json();
-    } catch {
-      // Non-JSON error body — keep the generic message set above.
-    }
-    throw new ScanError(body.detail, body.orientations_tried);
-  }
+  if (!res.ok) throw await readApiError(res);
 
   return res.json();
 }
@@ -159,6 +178,12 @@ export interface InspectionResponse {
   rule7: Rule7Result | null;
   overall_status: OverallStatus;
   findings: string[];
+  /**
+   * The stored history record this inspection was saved as. Null when the
+   * server could not persist it — the verdict above is still valid and is
+   * still shown; only the history link is missing.
+   */
+  inspection_id: number | null;
 }
 
 async function readApiError(res: Response): Promise<ScanError> {
@@ -167,6 +192,12 @@ async function readApiError(res: Response): Promise<ScanError> {
     body = await res.json();
   } catch {
     // Non-JSON error body — keep the generic message set above.
+  }
+  if (res.status === 401) {
+    // The stored token is provably useless; drop it so the next page load
+    // doesn't retry with it.
+    clearToken();
+    return new AuthError(body.detail);
   }
   return new ScanError(body.detail, body.orientations_tried);
 }
@@ -187,13 +218,13 @@ export async function getRule7Candidates(
 
   let res: Response;
   try {
-    res = await fetch(`${API_URL}/measure/candidates`, { method: "POST", body: form });
+    res = await fetch(`${API_URL}/measure/candidates`, {
+      method: "POST",
+      body: form,
+      headers: authHeaders(),
+    });
   } catch {
-    throw new ScanError(
-      `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`,
-      undefined,
-      SERVICE_UNAVAILABLE_MESSAGE
-    );
+    throw unreachable();
   }
   if (!res.ok) throw await readApiError(res);
   return res.json();
@@ -228,13 +259,13 @@ export async function getRule7RegionMeasurement(
 
   let res: Response;
   try {
-    res = await fetch(`${API_URL}/measure/region`, { method: "POST", body: form });
+    res = await fetch(`${API_URL}/measure/region`, {
+      method: "POST",
+      body: form,
+      headers: authHeaders(),
+    });
   } catch {
-    throw new ScanError(
-      `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`,
-      undefined,
-      SERVICE_UNAVAILABLE_MESSAGE
-    );
+    throw unreachable();
   }
   if (!res.ok) throw await readApiError(res);
   return res.json();
@@ -260,6 +291,15 @@ export interface InspectParams {
   /** Fallback selection mechanism — takes priority over targetIndex if both are set. */
   region?: Rule7Region;
   rotationDeg?: number;
+  /**
+   * Update this existing history record instead of creating a new one.
+   * Set when adding a Rule 7 measurement to a pack that was already
+   * scanned, so one physical inspection stays one row with one set of
+   * evidence images.
+   */
+  inspectionId?: number | null;
+  /** Optional label for the history list. Never inferred from the photo. */
+  productName?: string;
 }
 
 /**
@@ -274,6 +314,12 @@ export interface InspectParams {
  */
 export async function inspectPack(params: InspectParams): Promise<InspectionResponse> {
   const form = new FormData();
+  if (params.inspectionId != null) {
+    form.append("inspection_id", String(params.inspectionId));
+  }
+  if (params.productName) {
+    form.append("product_name", params.productName);
+  }
   if (params.rule6Result) {
     form.append("rule6_result", JSON.stringify(params.rule6Result));
   } else if (params.rule6Image) {
@@ -297,14 +343,193 @@ export async function inspectPack(params: InspectParams): Promise<InspectionResp
 
   let res: Response;
   try {
-    res = await fetch(`${API_URL}/inspect`, { method: "POST", body: form });
+    res = await fetch(`${API_URL}/inspect`, {
+      method: "POST",
+      body: form,
+      headers: authHeaders(),
+    });
   } catch {
-    throw new ScanError(
-      `Could not reach the PRAMAAN API at ${API_URL}. Is uvicorn running?`,
-      undefined,
-      SERVICE_UNAVAILABLE_MESSAGE
-    );
+    throw unreachable();
   }
   if (!res.ok) throw await readApiError(res);
   return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+export interface LoginResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  user: User;
+}
+
+/**
+ * Exchange credentials for a bearer token. This is the one call that does
+ * NOT send an Authorization header — there is nothing to send yet.
+ */
+export async function login(username: string, password: string): Promise<LoginResponse> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+  } catch {
+    throw unreachable();
+  }
+  if (!res.ok) {
+    let detail = `Sign-in failed (HTTP ${res.status})`;
+    try {
+      detail = (await res.json()).detail ?? detail;
+    } catch {
+      // keep the generic message
+    }
+    // A rejected sign-in is not an expired session: surfacing the server's
+    // own wording ("incorrect username or password") is what the person at
+    // the keyboard actually needs here.
+    throw new ScanError(detail, undefined, detail);
+  }
+  return res.json();
+}
+
+/** Who the server believes the stored token belongs to. */
+export async function fetchMe(): Promise<User> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/auth/me`, { headers: authHeaders() });
+  } catch {
+    throw unreachable();
+  }
+  if (!res.ok) throw await readApiError(res);
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Inspection history
+// ---------------------------------------------------------------------------
+
+export interface InspectionSummary {
+  id: number;
+  created_at: string;
+  product_name: string | null;
+  overall_status: OverallStatus;
+  mandatory_present: number;
+  mandatory_total: number;
+  rule7_verdict: "PASS" | "FAIL" | "REVIEW" | null;
+  manufacturer: string | null;
+  mrp: number | null;
+  net_quantity: string | null;
+  mfg_date: string | null;
+  has_rule7: boolean;
+  inspector_name: string | null;
+}
+
+/** Which stored evidence images exist for an inspection. */
+export type EvidenceKind = "rule6" | "rule7" | "overlay";
+
+export interface InspectionDetail extends InspectionSummary {
+  rule6: ScanResponse;
+  rule7: Rule7Result | null;
+  findings: string[];
+  evidence: EvidenceKind[];
+  rule6_image_stored: boolean;
+  rule7_image_stored: boolean;
+  rule7_overlay_stored: boolean;
+}
+
+export interface InspectionListResponse {
+  items: InspectionSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface InspectionFilters {
+  limit?: number;
+  offset?: number;
+  status?: OverallStatus | "";
+  q?: string;
+  dateFrom?: string;   // YYYY-MM-DD
+  dateTo?: string;     // YYYY-MM-DD
+}
+
+export async function listInspections(
+  filters: InspectionFilters = {}
+): Promise<InspectionListResponse> {
+  const params = new URLSearchParams();
+  params.set("limit", String(filters.limit ?? 20));
+  params.set("offset", String(filters.offset ?? 0));
+  if (filters.status) params.set("status", filters.status);
+  if (filters.q?.trim()) params.set("q", filters.q.trim());
+  if (filters.dateFrom) params.set("date_from", filters.dateFrom);
+  if (filters.dateTo) params.set("date_to", filters.dateTo);
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/inspections?${params}`, { headers: authHeaders() });
+  } catch {
+    throw unreachable();
+  }
+  if (!res.ok) throw await readApiError(res);
+  return res.json();
+}
+
+/**
+ * One stored inspection. The Rule 7 overlay is not inlined — fetch it with
+ * evidenceUrl()/fetchEvidence() instead, because that image alone is about
+ * 9 MB of base64 and would make opening a record slower than the scan was.
+ */
+export async function getInspection(id: number): Promise<InspectionDetail> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/inspections/${id}`, { headers: authHeaders() });
+  } catch {
+    throw unreachable();
+  }
+  if (!res.ok) throw await readApiError(res);
+  return res.json();
+}
+
+/** ADMIN only; an inspector account gets a 403 here. */
+export async function deleteInspection(id: number): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/inspections/${id}`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    });
+  } catch {
+    throw unreachable();
+  }
+  if (!res.ok) throw await readApiError(res);
+}
+
+/**
+ * Fetch one evidence image as an object URL.
+ *
+ * A plain <img src> cannot carry an Authorization header, and the
+ * alternative — putting the token in the query string — would write
+ * credentials into browser history and any proxy log. So the bytes are
+ * fetched properly and handed to the <img> as a blob URL. Callers must
+ * URL.revokeObjectURL() the result when the image unmounts; see
+ * components/evidence-image.tsx.
+ */
+export async function fetchEvidenceObjectUrl(
+  id: number,
+  kind: EvidenceKind
+): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/inspections/${id}/evidence/${kind}`, {
+      headers: authHeaders(),
+    });
+  } catch {
+    throw unreachable();
+  }
+  if (!res.ok) throw await readApiError(res);
+  return URL.createObjectURL(await res.blob());
 }
