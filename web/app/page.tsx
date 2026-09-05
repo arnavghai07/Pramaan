@@ -4,6 +4,7 @@ import { useCallback, useState } from "react";
 import Link from "next/link";
 import { RequireAuth } from "@/components/auth-provider";
 import { CapturePanel } from "@/components/capture-panel";
+import { AdditionalAnalysisPanel } from "@/components/additional-analysis";
 import { ResultsPanel } from "@/components/results-panel";
 import { ResultsSkeleton } from "@/components/results-skeleton";
 import { Rule7Panel } from "@/components/rule7-panel";
@@ -246,6 +247,10 @@ function ScannerPage() {
               />
             </div>
             <ResultsPanel result={status.inspection.rule6} />
+
+            <div className="w-full max-w-2xl mx-auto">
+              <AdditionalAnalysisPanel analysis={status.inspection.analysis} />
+            </div>
 
             <Rule7Readout rule7={status.inspection.rule7} />
 

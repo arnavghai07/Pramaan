@@ -237,7 +237,8 @@ def save_inspection(db: Session, *,
                     rule6_src_path: Optional[str] = None,
                     rule7_src_path: Optional[str] = None,
                     existing: Optional[Inspection] = None,
-                    inspector: Optional[Any] = None) -> Inspection:
+                    inspector: Optional[Any] = None,
+                    analysis: Optional[dict[str, Any]] = None) -> Inspection:
     """
     Persist one completed inspection, or update the one `existing` names.
 
@@ -272,6 +273,14 @@ def save_inspection(db: Session, *,
     if inspector is not None and row.inspector_id is None:
         row.inspector_id = inspector.id
         row.inspector_name = inspector.full_name or inspector.username
+
+    # Written only when this call actually produced one. Passing None leaves
+    # whatever is already stored alone, which is what the Rule 7 follow-up
+    # call needs: that call carries no declaration photograph, so overwriting
+    # here would replace a real readability measurement with "not assessed"
+    # and the record would get worse because more work was done on it.
+    if analysis is not None:
+        row.analysis_json = _jsonable(analysis)
 
     overlay_b64 = None
     if rule7 is not None:

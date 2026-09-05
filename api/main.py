@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session
 from engine.vlm_extract import BackendError, ExtractionFailed, extract
 from engine.measure_chart import (MarkerNotFound, MarkerTilted, measure, rule7_result,
                                   rule7_measure_selected_region)
+from engine.analysis import run_analysis
 from engine.verdict import combine_status
 
 from api.models import (CandidatesResponse, DashboardResponse, DeleteResponse,
@@ -298,12 +299,20 @@ async def inspect(rule6_image: Optional[UploadFile] = File(None),
     inspection_id null and the reason logged server-side. A verdict that
     cost a minute of inference is not thrown away because a disk was full.
     """
+    # The analysis already stored against this inspection, if any. Read here,
+    # in the block that already validates the id, so the Rule 7 follow-up call
+    # (which carries no declaration photograph) can carry the earlier
+    # image-based analysis forward instead of downgrading it to "not
+    # assessed" — see engine.analysis.run_analysis()'s `prior`.
+    prior_analysis = None
     if inspection_id is not None:
         with session_scope() as db:
-            if repository.get_inspection(db, inspection_id) is None:
+            stored = repository.get_inspection(db, inspection_id)
+            if stored is None:
                 raise HTTPException(
                     status_code=404,
                     detail=f"no stored inspection with id {inspection_id}")
+            prior_analysis = stored.analysis_json
 
     rule6_path = await _save_upload(rule6_image) if rule6_image else None
     rule7_path = await _save_upload(rule7_image) if rule7_image else None
@@ -360,7 +369,22 @@ async def inspect(rule6_image: Optional[UploadFile] = File(None),
             except (MarkerNotFound, MarkerTilted, ValueError) as e:
                 rule7 = {"attempted": True, "problem": str(e)}
 
-        overall_status, findings = combine_status(rule6, rule7)
+        # Placement, readability and declaration validation. Deterministic,
+        # image-and-arithmetic only, and kept strictly downstream of Rule 6
+        # and Rule 7: combine_status() folds it in last and it can only ever
+        # make the status stricter (engine/verdict.py._apply_analysis()).
+        # A fault here must not cost a completed inspection, so it degrades
+        # to "no analysis" — which reads as NOT ASSESSED everywhere, never
+        # as a pass.
+        try:
+            analysis = run_analysis(rule6, image_path=rule6_path,
+                                    prior=prior_analysis)
+        except Exception as e:                  # noqa: BLE001
+            print(f"[analysis] additional checks could not run: {e!r}",
+                  file=sys.stderr)
+            analysis = prior_analysis
+
+        overall_status, findings = combine_status(rule6, rule7, analysis)
 
         # Persist AFTER the verdict exists and BEFORE the finally block
         # deletes the uploads — repository.save_inspection() copies those
@@ -376,14 +400,14 @@ async def inspect(rule6_image: Optional[UploadFile] = File(None),
                     db, rule6=rule6, rule7=rule7, overall_status=overall_status,
                     findings=findings, product_name=product_name,
                     rule6_src_path=rule6_path, rule7_src_path=rule7_path,
-                    existing=existing, inspector=user)
+                    existing=existing, inspector=user, analysis=analysis)
                 saved_id = row.id
         except Exception as e:                      # noqa: BLE001 — see docstring
             print(f"[storage] inspection could not be saved: {e!r}", file=sys.stderr)
 
         return {"rule6": rule6, "rule7": rule7,
                 "overall_status": overall_status, "findings": findings,
-                "inspection_id": saved_id}
+                "analysis": analysis, "inspection_id": saved_id}
     finally:
         if rule6_path:
             os.remove(rule6_path)
@@ -484,6 +508,10 @@ def get_inspection(inspection_id: int,
             "rule6": row.rule6_result_json,
             "rule7": repository.rule7_for_response(row, include_overlay=include_overlay),
             "findings": row.findings_json or [],
+            # Null, not an empty analysis: an inspection recorded before these
+            # checks existed was never analysed, and saying so is the honest
+            # answer. The client renders "Not assessed for this inspection".
+            "analysis": row.analysis_json,
             "evidence": available,
             "rule6_image_stored": "rule6" in available,
             "rule7_image_stored": "rule7" in available,

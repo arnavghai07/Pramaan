@@ -42,6 +42,9 @@ from storage.models import Inspection
 #: differently.
 NOT_RECORDED = "Not recorded"
 NOT_CAPTURED = "Not captured for this inspection"
+#: Printed for every additional check on an inspection recorded before those
+#: checks existed. Not a blank and not a pass — see ANALYSIS_STATE_LABEL.
+NOT_ASSESSED_TEXT = "Not assessed for this inspection"
 
 #: How the three stored verdicts are spelled out for a reader who is not
 #: reading JSON. The key is the exact string in the database.
@@ -59,6 +62,33 @@ STATUS_NOTE = {
     "NEEDS_MANUAL_REVIEW": "One or more checks could not be decided "
                            "automatically and require an officer's judgement.",
 }
+
+#: How engine/analysis.py's four states are spelled out. NOT_ASSESSED is
+#: spelled out in full rather than left blank: a heading with nothing under it
+#: reads to an officer as a check that passed.
+ANALYSIS_STATE_LABEL = {
+    "PASS": "PASS",
+    "FAIL": "FAIL",
+    "REVIEW": "NEEDS MANUAL REVIEW",
+    "NOT_ASSESSED": "NOT ASSESSED",
+}
+
+#: The three checks in the order they are printed, with the wording used when
+#: a record carries no analysis at all.
+ANALYSIS_ORDER = [
+    ("placement", "Declaration placement",
+     "This inspection predates PRAMAAN's placement check, so placement was "
+     "never assessed for it."),
+    ("capture_observation", "Capture observation",
+     "This inspection predates PRAMAAN's capture check, so the photograph "
+     "itself was never assessed for it."),
+    ("readability", "Readability",
+     "This inspection predates PRAMAAN's readability measurement, so image "
+     "readability was never assessed for it."),
+    ("declaration_validation", "Declaration validation",
+     "This inspection predates PRAMAAN's declaration-validation check, so the "
+     "structure of the declarations was never assessed for it."),
+]
 
 #: The evidence images a report may carry, in the order they are shown, with
 #: the caption each gets. Keys are repository.EVIDENCE_KINDS keys.
@@ -88,6 +118,23 @@ class Rule6Row:
     state: str          # PRESENT | MISSING | REVIEW, exactly as stored
     value: str          # the extracted text, or NOT_RECORDED
     requirement: str    # "Mandatory" | "Optional"
+
+
+@dataclass
+class AnalysisSection:
+    """
+    One additional check as it is printed. `findings` are already prefixed
+    with their severity, so neither renderer has to decide how to show one.
+    """
+    title: str
+    state: str            # raw stored string, or NOT_ASSESSED
+    state_label: str
+    explanation: str
+    #: An advisory section is printed in full and then explicitly labelled as
+    #: not affecting the verdict — a reader of a filed report has no other way
+    #: to know that one of these rows did not count.
+    advisory: bool = False
+    findings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -125,6 +172,12 @@ class ReportData:
     #: selected has rows but no verdict.
     rule7_rows: list[tuple[str, str]] = field(default_factory=list)
     rule7_note: str = ""
+
+    #: Placement, readability and declaration validation. Always exactly
+    #: three entries, even on a record that carries no analysis — the three
+    #: then say so explicitly.
+    analysis_sections: list[AnalysisSection] = field(default_factory=list)
+    analysis_note: str = ""
 
     findings: list[str] = field(default_factory=list)
     evidence: list[EvidenceItem] = field(default_factory=list)
@@ -222,6 +275,45 @@ def _rule7_section(rule7: Optional[dict[str, Any]]) -> tuple[list[tuple[str, str
     return rows, note
 
 
+def _analysis_section(analysis: Optional[dict[str, Any]]) -> tuple[list[AnalysisSection], str]:
+    """
+    The three additional checks, printed whether or not they ran.
+
+    A record stored before this feature existed has analysis None. It is NOT
+    backfilled here — re-running the checks now would put today's software's
+    opinion into a document that claims to reproduce a decision made months
+    ago. Each check prints NOT ASSESSED with the reason instead.
+    """
+    stored = {c.get("check"): c for c in (analysis or {}).get("checks", [])
+              if isinstance(c, dict)}
+
+    sections: list[AnalysisSection] = []
+    for key, title, absent_text in ANALYSIS_ORDER:
+        check = stored.get(key)
+        if not check:
+            sections.append(AnalysisSection(
+                title=title, state="NOT_ASSESSED",
+                state_label=ANALYSIS_STATE_LABEL["NOT_ASSESSED"],
+                explanation=absent_text))
+            continue
+        state = str(check.get("state", "NOT_ASSESSED")).upper()
+        findings = [f"[{f.get('severity', 'REVIEW')}] {f.get('message', '')}".strip()
+                    for f in (check.get("findings") or []) if isinstance(f, dict)]
+        sections.append(AnalysisSection(
+            title=str(check.get("title") or title),
+            state=state,
+            state_label=ANALYSIS_STATE_LABEL.get(state, state),
+            explanation=_text(check.get("explanation")) or "",
+            advisory=bool(check.get("advisory")),
+            findings=[f for f in findings if f]))
+
+    note = ("" if analysis else
+            NOT_ASSESSED_TEXT + ". These checks were added to PRAMAAN after "
+            "this inspection was recorded, and the record is reproduced as it "
+            "was decided rather than re-analysed.")
+    return sections, note
+
+
 def build_report_data(inspection: Inspection) -> ReportData:
     """
     Read one stored inspection into the printable view model.
@@ -237,6 +329,8 @@ def build_report_data(inspection: Inspection) -> ReportData:
 
     rows, missing, summary, problems = _rule6_section(rule6)
     rule7_rows, rule7_note = _rule7_section(rule7)
+    analysis_sections, analysis_note = _analysis_section(
+        getattr(inspection, "analysis_json", None))
 
     status = inspection.overall_status
     findings = [str(f) for f in (inspection.findings_json or []) if str(f).strip()]
@@ -265,6 +359,8 @@ def build_report_data(inspection: Inspection) -> ReportData:
         rule6_problems=problems,
         rule7_rows=rule7_rows,
         rule7_note=rule7_note,
+        analysis_sections=analysis_sections,
+        analysis_note=analysis_note,
         findings=findings,
         evidence=evidence,
     )

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
+import { AdditionalAnalysisPanel } from "@/components/additional-analysis";
 import { RequireAuth, useAuth } from "@/components/auth-provider";
 import { EvidenceImage } from "@/components/evidence-image";
 import { ResultsPanel } from "@/components/results-panel";
@@ -262,6 +263,10 @@ function Detail() {
           </div>
         )}
       </section>
+
+      <div className="w-full max-w-2xl mx-auto">
+        <AdditionalAnalysisPanel analysis={record.analysis} />
+      </div>
 
       <section className="flex flex-col gap-4">
         <h2 className="text-sm font-medium text-muted-foreground">Evidence</h2>

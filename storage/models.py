@@ -118,6 +118,14 @@ class Inspection(Base):
     rule7_result_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
     findings_json: Mapped[list[str]] = mapped_column(JSON, default=list)
 
+    # --- engine/analysis.py's placement / readability / declaration-validation
+    #     result. NULLABLE, and null is a meaningful value: every inspection
+    #     recorded before this analysis existed has none, and must keep none.
+    #     Reading it back as "not assessed" rather than backfilling a guess is
+    #     what keeps an old record reproducible - see reports/builder.py and
+    #     engine/verdict.py._apply_analysis().
+    analysis_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+
     # --- evidence, stored RELATIVE to storage.database.DATA_DIR so moving or
     #     copying the data directory does not invalidate every stored path.
     rule6_image_path: Mapped[Optional[str]] = mapped_column(Text)

@@ -30,7 +30,7 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect as sa_inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -71,12 +71,40 @@ def init_db() -> None:
 
     create_all() only ever ADDS missing tables. It does not alter an
     existing one, so a future column change needs a real migration (Alembic
-    in Phase H) rather than a silent schema drift.
+    in Phase H) rather than a silent schema drift. _add_missing_columns()
+    below is the one narrow exception — see its docstring.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     from storage import models  # noqa: F401  — registers the tables on Base
     Base.metadata.create_all(engine)
+    _add_missing_columns()
+
+
+#: Columns added to an already-created table after the fact, as
+#: (table, column, SQL type). ADDITIVE ONLY: a nullable column with no
+#: default, which SQLite can add in place without rewriting or reading a
+#: single existing row. Nothing here may drop, rename or retype a column —
+#: that is a real migration and belongs to Alembic in Phase H. The point is
+#: that an inspector who has been recording evidence for weeks keeps every
+#: row, and the new column simply reads NULL on all of them, which is the
+#: honest answer: those inspections were never analysed.
+_ADDITIVE_COLUMNS = [
+    ("inspections", "analysis_json", "JSON"),
+]
+
+
+def _add_missing_columns() -> None:
+    inspector = sa_inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        for table, column, sql_type in _ADDITIVE_COLUMNS:
+            if table not in existing_tables:
+                continue        # create_all() just made it, with the column
+            have = {c["name"] for c in inspector.get_columns(table)}
+            if column in have:
+                continue
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
 
 
 def get_db():

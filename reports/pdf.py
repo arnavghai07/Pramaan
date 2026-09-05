@@ -251,6 +251,21 @@ def render_pdf(data: ReportData) -> bytes:
         story.append(Spacer(1, 5))
         story.append(Paragraph(_escape(data.rule7_note), styles["muted"]))
 
+    story.append(Paragraph("Additional compliance analysis", styles["h2"]))
+    if data.analysis_note:
+        story.append(Paragraph(_escape(data.analysis_note), styles["muted"]))
+        story.append(Spacer(1, 5))
+    for section in data.analysis_sections:
+        suffix = " (advisory &mdash; does not affect the verdict)" if section.advisory else ""
+        story.append(Paragraph(
+            f"{_escape(section.title)} &mdash; {_escape(section.state_label)}{suffix}",
+            styles["cellhead"]))
+        if section.explanation:
+            story.append(Paragraph(_escape(section.explanation), styles["body"]))
+        if section.findings:
+            story.extend(_bullets(styles, section.findings))
+        story.append(Spacer(1, 8))
+
     story.append(Paragraph("Findings", styles["h2"]))
     if data.findings:
         story.extend(_bullets(styles, data.findings))

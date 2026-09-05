@@ -95,11 +95,54 @@ class Rule7Result(BaseModel):
     overlay_png_base64: Optional[str] = None
 
 
+class AnalysisFinding(BaseModel):
+    """One problem a single additional check established."""
+    severity: Literal["FAIL", "REVIEW", "NOT_ASSESSED"]
+    message: str
+
+
+class AnalysisCheck(BaseModel):
+    """
+    One of engine/analysis.py's three checks, as stored and as returned.
+
+    `state` carries four values, not three. NOT_ASSESSED is distinct from
+    REVIEW on purpose: "the evidence was ambiguous" and "the evidence this
+    check needs was never supplied" are different facts and an officer fixes
+    them differently. Neither is ever rendered as a pass.
+
+    `metrics` is an open dict of the numbers the check actually measured
+    (focus variance, contrast, text coverage). It is evidence for the state
+    above, not a second verdict — nothing downstream branches on it.
+    """
+    check: str
+    title: str
+    state: Literal["PASS", "FAIL", "REVIEW", "NOT_ASSESSED"]
+    explanation: str
+    #: True for a check that is shown to the officer but is not allowed to
+    #: move the compliance verdict — today, the capture observation, whose
+    #: heuristic is uncalibrated. Defaults False so a record stored before
+    #: the flag existed reads as verdict-bearing, which is what it was.
+    advisory: bool = False
+    findings: list[AnalysisFinding] = []
+    metrics: dict = {}
+
+
+class AdditionalAnalysis(BaseModel):
+    version: int
+    overall_state: Literal["PASS", "FAIL", "REVIEW", "NOT_ASSESSED"]
+    checks: list[AnalysisCheck] = []
+
+
 class InspectionResponse(BaseModel):
     rule6: ScanResponse
     rule7: Optional[Rule7Result] = None
     overall_status: str   # COMPLIANT | NON_COMPLIANT | NEEDS_MANUAL_REVIEW
     findings: list[str] = []
+    # Null for an inspection recorded before the additional checks existed.
+    # Optional so an existing client that has never heard of this field
+    # behaves exactly as it did before — and so "no analysis" stays visibly
+    # different from "analysis that found nothing".
+    analysis: Optional[AdditionalAnalysis] = None
     # Set once the inspection has been persisted (storage/repository.py).
     # Optional, and null when persistence failed, so an existing client that
     # ignores this field behaves exactly as it did before history existed —
@@ -155,6 +198,9 @@ class InspectionDetail(InspectionSummary):
     rule6: ScanResponse
     rule7: Optional[Rule7Result] = None
     findings: list[str] = []
+    #: Null on any inspection stored before this analysis existed. The client
+    #: shows "Not assessed for this inspection" rather than inventing a state.
+    analysis: Optional[AdditionalAnalysis] = None
     # Which evidence files exist for this inspection. The images themselves
     # are served by GET /inspections/{id}/evidence/{kind} rather than inlined
     # here: the Rule 7 overlay alone runs to ~9 MB of base64, which would

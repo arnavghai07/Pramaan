@@ -173,11 +173,54 @@ export interface Rule7Region {
 
 export type OverallStatus = "COMPLIANT" | "NON_COMPLIANT" | "NEEDS_MANUAL_REVIEW";
 
+/**
+ * The four states engine/analysis.py can return, and the reason there are
+ * four rather than three. REVIEW means the evidence existed and was
+ * ambiguous; NOT_ASSESSED means the evidence the check needs was never
+ * supplied, or the check cannot be performed at all. Neither is ever
+ * rendered as a pass.
+ */
+export type AnalysisState = "PASS" | "FAIL" | "REVIEW" | "NOT_ASSESSED";
+
+export interface AnalysisFinding {
+  severity: "FAIL" | "REVIEW" | "NOT_ASSESSED";
+  message: string;
+}
+
+export interface AnalysisCheck {
+  check: string;
+  title: string;
+  state: AnalysisState;
+  explanation: string;
+  /**
+   * True for a check shown to the officer that is NOT allowed to move the
+   * compliance verdict — today the capture observation, whose frame-edge
+   * heuristic is uncalibrated. Absent on records stored before the flag
+   * existed, which is why it is optional.
+   */
+  advisory?: boolean;
+  findings: AnalysisFinding[];
+  /** The numbers the check actually measured. Evidence, not a verdict. */
+  metrics: Record<string, number | string>;
+}
+
+export interface AdditionalAnalysis {
+  version: number;
+  overall_state: AnalysisState;
+  checks: AnalysisCheck[];
+}
+
 export interface InspectionResponse {
   rule6: ScanResponse;
   rule7: Rule7Result | null;
   overall_status: OverallStatus;
   findings: string[];
+  /**
+   * Null on an inspection recorded before these checks existed. Null and an
+   * analysis that found nothing are different facts and are shown
+   * differently — see AdditionalAnalysisPanel.
+   */
+  analysis: AdditionalAnalysis | null;
   /**
    * The stored history record this inspection was saved as. Null when the
    * server could not persist it — the verdict above is still valid and is
@@ -435,6 +478,7 @@ export interface InspectionDetail extends InspectionSummary {
   rule6: ScanResponse;
   rule7: Rule7Result | null;
   findings: string[];
+  analysis: AdditionalAnalysis | null;
   evidence: EvidenceKind[];
   rule6_image_stored: boolean;
   rule7_image_stored: boolean;

@@ -173,6 +173,18 @@ def render_docx(data: ReportData) -> bytes:
     if data.rule7_note:
         _muted(document, data.rule7_note)
 
+    document.add_heading("Additional compliance analysis", level=1)
+    if data.analysis_note:
+        _muted(document, data.analysis_note)
+    for section in data.analysis_sections:
+        suffix = " (advisory — does not affect the verdict)" if section.advisory else ""
+        document.add_heading(
+            f"{section.title} — {section.state_label}{suffix}", level=2)
+        if section.explanation:
+            document.add_paragraph(section.explanation)
+        if section.findings:
+            _bullets(document, section.findings)
+
     document.add_heading("Findings", level=1)
     if data.findings:
         _bullets(document, data.findings)
