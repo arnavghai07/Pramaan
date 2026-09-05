@@ -533,3 +533,57 @@ export async function fetchEvidenceObjectUrl(
   if (!res.ok) throw await readApiError(res);
   return URL.createObjectURL(await res.blob());
 }
+
+// ---------------------------------------------------------------------------
+// Enforcement dashboard
+// ---------------------------------------------------------------------------
+
+export interface StatusCounts {
+  compliant: number;
+  non_compliant: number;
+  needs_manual_review: number;
+  other: number;
+}
+
+export interface Rule7Counts {
+  passed: number;
+  failed: number;
+  review: number;
+  pending_selection: number;
+  not_measured: number;
+}
+
+export interface FindingCount {
+  finding: string;
+  count: number;
+}
+
+/**
+ * Mirrors api/models.py DashboardResponse. Every number is aggregated in
+ * SQL server-side; the page never fetches history to add it up itself.
+ * `compliance_rate` is null — not 0 — when nothing has been inspected yet.
+ */
+export interface DashboardResponse {
+  total: number;
+  status: StatusCounts;
+  compliance_rate: number | null;
+  rule7: Rule7Counts;
+  incomplete_declarations: number;
+  missing_declarations: number;
+  top_findings: FindingCount[];
+  findings_considered: number;
+  recent: InspectionSummary[];
+}
+
+export async function getDashboard(recent = 8): Promise<DashboardResponse> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/dashboard?recent=${recent}`, {
+      headers: authHeaders(),
+    });
+  } catch {
+    throw unreachable();
+  }
+  if (!res.ok) throw await readApiError(res);
+  return res.json();
+}

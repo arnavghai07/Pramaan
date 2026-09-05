@@ -207,3 +207,64 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int          # seconds
     user: UserOut
+
+
+# ---------------------------------------------------------------------------
+# Enforcement dashboard
+# ---------------------------------------------------------------------------
+class StatusCounts(BaseModel):
+    """
+    How many stored inspections carry each verdict. `other` exists so a
+    verdict string this build does not know about is still counted in the
+    total instead of vanishing from the dashboard — a silently dropped
+    inspection would read as "fewer violations", which is exactly the kind
+    of quiet omission CLAUDE.md rule 2 forbids.
+    """
+    compliant: int = 0
+    non_compliant: int = 0
+    needs_manual_review: int = 0
+    other: int = 0
+
+
+class Rule7Counts(BaseModel):
+    """
+    The Rule 7 measurement mix. `pending_selection` is an inspection whose
+    measurement photo was processed but where no target numeral was ever
+    picked, and `not_measured` is one where no Rule 7 photo was taken at
+    all. Both are "no Rule 7 verdict", and an officer chasing incomplete
+    work needs to know which.
+    """
+    passed: int = 0
+    failed: int = 0
+    review: int = 0
+    pending_selection: int = 0
+    not_measured: int = 0
+
+
+class FindingCount(BaseModel):
+    finding: str
+    count: int
+
+
+class DashboardResponse(BaseModel):
+    """
+    GET /dashboard. Every number here is an aggregate of verdicts already
+    stored by storage/repository.py — nothing on this endpoint re-runs the
+    engine or re-decides a status. `compliance_rate` is plain arithmetic
+    over the counts (compliant / total x 100), null when there are no
+    inspections yet rather than 0, because "0% compliant" and "nothing
+    inspected" are different facts.
+    """
+    total: int
+    status: StatusCounts
+    compliance_rate: Optional[float] = None
+    rule7: Rule7Counts
+    #: Inspections with at least one mandatory Rule 6 declaration missing.
+    incomplete_declarations: int
+    #: Total count of missing mandatory declarations across those inspections.
+    missing_declarations: int
+    top_findings: list[FindingCount] = []
+    #: How many non-compliant/review inspections the findings tally read.
+    #: Bounded — see repository.FINDINGS_WINDOW.
+    findings_considered: int
+    recent: list[InspectionSummary] = []

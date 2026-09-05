@@ -42,9 +42,9 @@ from engine.measure_chart import (MarkerNotFound, MarkerTilted, measure, rule7_r
                                   rule7_measure_selected_region)
 from engine.verdict import combine_status
 
-from api.models import (CandidatesResponse, DeleteResponse, InspectionDetail,
-                        InspectionListResponse, InspectionResponse, InspectionSummary,
-                        MeasureResponse, Rule7Result, ScanResponse)
+from api.models import (CandidatesResponse, DashboardResponse, DeleteResponse,
+                        InspectionDetail, InspectionListResponse, InspectionResponse,
+                        InspectionSummary, MeasureResponse, Rule7Result, ScanResponse)
 from api.auth import current_user, require_admin
 from api.auth import router as auth_router
 
@@ -535,3 +535,61 @@ def delete_inspection(inspection_id: int, db: Session = Depends(get_db),
                             detail=f"no stored inspection with id {inspection_id}")
     db.commit()
     return {"id": inspection_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Enforcement dashboard
+# ---------------------------------------------------------------------------
+#: Verdict strings this build knows, mapped to their DashboardResponse field.
+#: Anything else a row carries is counted under "other" rather than dropped.
+_STATUS_FIELDS = {
+    "COMPLIANT": "compliant",
+    "NON_COMPLIANT": "non_compliant",
+    "NEEDS_MANUAL_REVIEW": "needs_manual_review",
+}
+
+
+@app.get("/dashboard", response_model=DashboardResponse)
+def dashboard(recent: int = Query(8, ge=1, le=25,
+                                  description="how many recent inspections to return"),
+              db: Session = Depends(get_db),
+              user: User = Depends(current_user)):
+    """
+    Summary view for enforcement officials: verdict mix, Rule 7 mix,
+    declaration shortfall, the findings seen most often, and the latest
+    inspections.
+
+    Available to any signed-in officer — an inspector needs to see the
+    district's compliance picture as much as an administrator does, and
+    nothing here exposes a field the history list does not already show.
+
+    THIS ENDPOINT DECIDES NOTHING. It counts verdicts that
+    engine/verdict.py issued and storage/repository.py stored, and it does
+    the counting in SQL (repository.dashboard_stats) rather than pulling
+    history into the browser. compliance_rate below is arithmetic over
+    those counts, not a judgement: null when nothing has been inspected
+    yet, because "no data" must not render as 0% compliant.
+    """
+    stats = repository.dashboard_stats(db, recent_limit=recent)
+
+    counts = {"compliant": 0, "non_compliant": 0, "needs_manual_review": 0, "other": 0}
+    for status_value, count in stats["by_status"].items():
+        counts[_STATUS_FIELDS.get(status_value, "other")] += count
+
+    total = stats["total"]
+    rate = round(counts["compliant"] / total * 100, 1) if total else None
+
+    r7 = stats["rule7"]
+    return {
+        "total": total,
+        "status": counts,
+        "compliance_rate": rate,
+        "rule7": {"passed": r7["PASS"], "failed": r7["FAIL"], "review": r7["REVIEW"],
+                  "pending_selection": r7["pending_selection"],
+                  "not_measured": r7["not_measured"]},
+        "incomplete_declarations": stats["incomplete_declarations"],
+        "missing_declarations": stats["missing_declarations"],
+        "top_findings": stats["top_findings"],
+        "findings_considered": stats["findings_considered"],
+        "recent": [InspectionSummary(**_summary(r)) for r in stats["recent"]],
+    }

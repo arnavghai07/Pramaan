@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, case, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from storage.database import DATA_DIR, EVIDENCE_DIR
@@ -364,3 +364,128 @@ def delete_inspection(db: Session, inspection_id: int) -> bool:
     if evidence.exists():
         shutil.rmtree(evidence, ignore_errors=True)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Dashboard aggregation
+# ---------------------------------------------------------------------------
+#: How many recent non-passing inspections the findings tally reads.
+#:
+#: findings_json is a JSON column, so there is no way to GROUP BY a finding
+#: in SQLite without reading the rows. This is the one aggregate here that
+#: cannot be done entirely in SQL, so it is bounded: the query projects ONLY
+#: the findings column (never whole rows, never evidence) of the most recent
+#: non-passing inspections. Everything else on the dashboard is a real
+#: COUNT/SUM over indexed columns and is exact at any table size.
+FINDINGS_WINDOW = 200
+
+#: Verdict string for a clean inspection. Imported as a literal rather than
+#: from engine/verdict.py to keep the storage layer free of engine imports it
+#: does not need — this file only ever compares stored strings, it never
+#: produces one.
+_COMPLIANT = "COMPLIANT"
+
+
+def dashboard_stats(db: Session, *, recent_limit: int = 8,
+                    findings_window: int = FINDINGS_WINDOW) -> dict[str, Any]:
+    """
+    Everything the enforcement dashboard shows, aggregated in the database.
+
+    NOTHING HERE DECIDES ANYTHING. Every number is a count of verdicts
+    engine/verdict.py already issued and repository.save_inspection()
+    already stored. There is no branch below that could turn a stored
+    REVIEW into a compliant tally, and no status is derived from anything
+    other than the `overall_status` column itself — CLAUDE.md rule 1 again.
+
+    Returned counts are keyed by the exact strings stored in the column, so
+    a future fourth status shows up here without a change to this function
+    (the API layer maps the three it knows and reports the rest as-is).
+    """
+    # --- verdict mix: one GROUP BY over an indexed column.
+    by_status: dict[str, int] = {
+        str(status): int(count)
+        for status, count in db.execute(
+            select(Inspection.overall_status, func.count())
+            .group_by(Inspection.overall_status)
+        ).all()
+    }
+    total = sum(by_status.values())
+
+    # --- Rule 7 mix. A null rule7_verdict means two different things and an
+    #     officer needs them separated: "no measurement photo was taken" and
+    #     "a photo was measured but no target row was ever selected". The
+    #     first is a normal incomplete inspection, the second is an
+    #     abandoned measurement. rule7_result_json IS NULL distinguishes them.
+    #
+    #     Note the cast. SQLAlchemy's JSON type stores a Python None as the
+    #     JSON value `null` (the four characters), NOT as SQL NULL, so
+    #     `.is_(None)` matches nothing and every unmeasured inspection would
+    #     be reported as "measured, awaiting selection". On the way out the
+    #     column deserialises back to Python None, which is why nothing else
+    #     in PRAMAAN notices — it only bites a query that filters in SQL.
+    #     Casting to text and comparing against 'null' catches both forms and
+    #     works on SQLite and on Postgres.
+    unmeasured = or_(Inspection.rule7_result_json.is_(None),
+                     cast(Inspection.rule7_result_json, String) == "null")
+    measured = case((unmeasured, 0), else_=1)
+    rule7 = {"PASS": 0, "FAIL": 0, "REVIEW": 0,
+             "pending_selection": 0, "not_measured": 0}
+    for verdict, was_measured, count in db.execute(
+        select(Inspection.rule7_verdict, measured, func.count())
+        .group_by(Inspection.rule7_verdict, measured)
+    ).all():
+        count = int(count)
+        if verdict in ("PASS", "FAIL", "REVIEW"):
+            rule7[str(verdict)] += count
+        elif was_measured:
+            rule7["pending_selection"] += count
+        else:
+            rule7["not_measured"] += count
+
+    # --- declaration shortfall, straight from the denormalised counters.
+    incomplete = db.scalar(
+        select(func.count()).select_from(Inspection)
+        .where(Inspection.mandatory_present < Inspection.mandatory_total)
+    ) or 0
+    missing_declarations = db.scalar(
+        select(func.coalesce(
+            func.sum(Inspection.mandatory_total - Inspection.mandatory_present), 0))
+        .where(Inspection.mandatory_present < Inspection.mandatory_total)
+    ) or 0
+
+    # --- most frequent findings among inspections that did not come out
+    #     clean. Compliant rows are excluded on purpose: their findings are
+    #     records of checks that PASSED ("Rule 7: ... - PASS"), and counting
+    #     those next to violations would read as a violation league table
+    #     with passes in it.
+    finding_counts: dict[str, int] = {}
+    for (findings,) in db.execute(
+        select(Inspection.findings_json)
+        .where(Inspection.overall_status != _COMPLIANT)
+        .order_by(Inspection.created_at.desc(), Inspection.id.desc())
+        .limit(findings_window)
+    ).all():
+        for finding in (findings or []):
+            text = str(finding).strip()
+            if text:
+                finding_counts[text] = finding_counts.get(text, 0) + 1
+    top_findings = sorted(finding_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+
+    considered = min(total - by_status.get(_COMPLIANT, 0), findings_window)
+
+    recent = list(db.scalars(
+        select(Inspection)
+        .order_by(Inspection.created_at.desc(), Inspection.id.desc())
+        .limit(recent_limit)
+    ).all())
+
+    return {
+        "total": total,
+        "by_status": by_status,
+        "rule7": rule7,
+        "incomplete_declarations": int(incomplete),
+        "missing_declarations": int(missing_declarations),
+        "top_findings": [{"finding": text, "count": n} for text, n in top_findings],
+        "findings_considered": max(0, considered),
+        "recent": recent,
+    }

@@ -27,6 +27,7 @@ export function AppNav() {
 
   const links = [
     { href: "/", label: "New inspection" },
+    { href: "/dashboard", label: "Dashboard" },
     { href: "/inspections", label: "History" },
   ];
 
